@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-exl3"
+version = "0.2.1"
+description = "EXL3 (ExLlamaV3 trellis/MCG) native Blackwell sm_121 quantization plugin for SGLang with Dynamic FP8 DSpark stages and a compiled batched MoE kernel"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "Victor Cruz" }]
+keywords = ["sglang", "exl3", "exllamav3", "quantization", "moe", "blackwell", "dgx-spark"]
+
+[project.urls]
+Homepage = "https://github.com/vcruz305/sglang-exl3"
+Repository = "https://github.com/vcruz305/sglang-exl3"
+
+[tool.setuptools.packages.find]
+where = ["src"]
