@@ -93,3 +93,8 @@ Apache-2.0. See `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md` — some
 kernel code originates from [Mia's AI Lab's
 GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks)
 project, attributed in the relevant `csrc/` file headers.
+
+## Contributing
+
+Adding a script? Read `CONTRIBUTING.md` first — check for existing
+tooling in `scripts/`/`tests`/`benchmarks/` before writing a new one.
