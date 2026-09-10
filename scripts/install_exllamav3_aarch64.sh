@@ -53,7 +53,27 @@ rm -rf ~/.cache/torch_extensions/*exllama* /tmp/torch_extensions/*exllama* 2>/de
 
 # 4. Build and install into venv
 echo "Compiling and installing exllamav3 into venv..."
+# Uninstall first. The version in the source tree rarely changes between runs, so pip treats
+# the requirement as already satisfied and skips the build entirely: edits to the ARM64 stub
+# then appear to install successfully while the old extension is still in place.
+"$PYTHON" -m pip uninstall -y exllamav3 >/dev/null 2>&1 || true
+rm -f "$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"/exllamav3_ext*.so
 "$PYTHON" -m pip install --no-build-isolation "$EXLLAMAV3_SRC"
+
+# 4b. Name any unresolved symbol before the import does it cryptically. The ARM64 stub
+#     replaces cpu/moe_mul1.cpp wholesale, so an entry upstream adds there links fine and
+#     only fails at dlopen as "undefined symbol: _Z24exl3_moe_cpu_pool_stressiiii".
+SO="$("$PYTHON" -c 'import sysconfig,glob,os; p=sysconfig.get_paths()["purelib"]; g=glob.glob(os.path.join(p,"exllamav3_ext*.so")); print(g[0] if g else "")')"
+if [[ -n "$SO" ]] && command -v nm >/dev/null 2>&1; then
+  MISSING="$(nm -D --undefined-only "$SO" 2>/dev/null | awk '{print $NF}' | grep -E 'exl3_|moe_cpu' || true)"
+  if [[ -n "$MISSING" ]]; then
+    echo "ERROR: the built extension has unresolved ExLlamaV3 symbols:" >&2
+    echo "$MISSING" | while read -r s; do echo "  $(c++filt "$s" 2>/dev/null || echo "$s")" >&2; done
+    echo "Add a stub for each to scripts/patch_exllamav3_aarch64.py, matching cpu/moe_mul1.h." >&2
+    exit 1
+  fi
+  echo "Symbol check: no unresolved ExLlamaV3 symbols in $(basename "$SO")"
+fi
 
 # 5. Verify import and symbol resolution
 echo "Verifying exllamav3 and exllamav3_ext import..."

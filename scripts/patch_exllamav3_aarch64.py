@@ -104,8 +104,19 @@ void exl3_moe_cpu_set_prof(bool) {}
 bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+bool exl3_moe_cpu_has_avx512_bw() { return false; }
+int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { std::abort(); }
 """,
     )
+
+    # NOTE on keeping the stub above current. It replaces cpu/moe_mul1.cpp wholesale, so when
+    # upstream adds an exl3_moe_cpu_* entry that lives in THAT file, the build and the link
+    # both still succeed (a shared object may carry undefined symbols) and it fails only at
+    # dlopen, with "undefined symbol: _Z24exl3_moe_cpu_pool_stressiiii" and nothing about the
+    # cause. install_exllamav3_aarch64.sh checks the built .so with nm and names them.
+    # Do not try to check that here by parsing sources: exl3_moe_cpu_set_memops and
+    # exl3_moe_cpu_worker_run are registered in bindings.cpp but defined in cpu/moe_handoff.cu,
+    # which is not stubbed, and their signatures span lines.
 
     for relative in ("cpu/moe_handoff.cu", "parallel/all_reduce_cpu.cu"):
         path = root / relative
@@ -131,6 +142,13 @@ bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
                 #else
                     std::this_thread::yield();
                 #endif"""
+        # Idempotent, unlike the whole-file writes above, which are idempotent for free.
+        # A reused source tree has already been rewritten, so the x86 block is gone and the
+        # count check would abort the build on the second run. set -euo pipefail in
+        # install_exllamav3_aarch64.sh then kills the install before pip ever sees it.
+        if old not in source and new in source:
+            print("already patched", path)
+            continue
         if source.count(old) != 1:
             raise SystemExit(f"expected one x86 pause block in {path}")
         write(path, source.replace(old, new))
