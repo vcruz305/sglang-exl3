@@ -12,8 +12,9 @@ architectures. For a specific model's tuned serving recipe (launch flags,
 speculative-decoding config, measured throughput, and the full
 investigation trail behind those numbers), see the separate recipe repo
 for that model — e.g.
-[`glm-5.3-exl3-recipe`](https://github.com/vcruz305/glm-5.3-exl3-recipe)
-for GLM-5.3-Flash-EXL3-K2.
+[`GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe`](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe)
+for GLM-5.3-Flash-EXL3-K2, or the model-coverage table below for all
+tested models.
 
 ## What this plugin provides
 
@@ -60,18 +61,42 @@ for GLM-5.3-Flash-EXL3-K2.
 
 ## Known model-architecture coverage
 
-- **GLM-5.3-Flash-EXL3-K2** (45 layers: 34 KDA linear-attention + 11 DSA
-  full-attention, 288 routed experts / 8 active) — primary integration
-  target; tested extensively. See the recipe repo above for the tuned
-  launch config and measured throughput.
-- **Qwen4Exp architecture (`Qwen4ExpForConditionalGeneration` /
-  `model_type: qwen4_exp`)** — **not currently loadable.** This is not an
-  EXL3-plugin limitation: the checkpoint's reported architecture isn't
-  registered in either upstream Transformers or upstream SGLang's model
-  registry (`AutoConfig.from_pretrained` fails before the EXL3 quant
-  path is ever reached). Needs a model-class implementation upstream (or
-  an architecture alias/shim) before this plugin can be tested against
-  it.
+Numbers below are **measured**, single DGX Spark GB10 (sm_121), from the
+model's own recipe repo — see each recipe for full launch flags,
+hardware notes, and the investigation trail behind the numbers.
+
+| Model | Quant | Layout | MTP / speculative | Decode tok/s | Recipe |
+| --- | --- | --- | --- | --- | --- |
+| GLM-5.3-Flash-EXL3-K2 | EXL3, ~91 GiB | 45 layers: 34 KDA linear-attn + 11 DSA full-attn, 288 routed experts / 8 active | k=2–16 MTP | ~16 tok/s @ 8k ctx | [vLLM recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) · [SGLang recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe) |
+| Qwen3.8-Flash-Next-EXL3 | EXL3, 3.05 bpw, ~87 GiB | `Qwen4ExpForConditionalGeneration` (`model_type: qwen4_exp`), QSA sparse attention | EAGLE/MTP, native-EXL3 draft (`steps=3 topk=1 draft_tokens=4`) | **~22–31 tok/s with MTP** (peak 35), **~17 tok/s baseline (no MTP)** | [SGLang recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-SGLang-DGX-Spark-recipe) · [vLLM recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe) |
+
+**Qwen4Exp / Qwen3.8-Flash-Next details:**
+
+- Architecture is registered upstream in both Transformers and SGLang as
+  of this plugin's `mul1`-codebook fix ([PR #1](https://github.com/vcruz305/sglang-exl3/pull/1),
+  merged `20bce5e`) — the earlier "not currently loadable" limitation
+  (missing MoE codebook multiplier handling for routed EXL3 experts) is
+  resolved.
+- EAGLE/MTP speculative decoding works via a second fix
+  ([PR #2](https://github.com/vcruz305/sglang-exl3/pull/2), merged) that
+  loads the MTP draft's MoE/linear layers as native EXL3 instead of
+  falling back to random-initialized dense/BF16 weights. Before this
+  fix: accept rate 0.00, accept len 1.00 (draft never contributed).
+  After: **accept rate 0.47–0.72, accept len 2.4–3.2**.
+- `speculative_eagle_topk` is **hard-capped at 1** for this architecture
+  (`NotImplementedError` above that) — not a tunable flag, confirmed via
+  direct testing of `topk=4`.
+- `speculative_num_steps` above 3 (e.g. `steps=4`–`6`) hits a CUDA
+  device-side assert in the QSA indexer's shared sparse-index buffer
+  (`QSAMTPSharedSparseIndices.tail_width`, sized for `steps=3` only) —
+  a runtime buffer-sizing bug, not a config issue. `steps=3` is the
+  current ceiling.
+- **Known open issue**: server becomes unreachable (`CUDA error:
+  device-side assert triggered` in the QSA indexer's gather kernel)
+  after ~60–70 minutes idle; the first request after the idle gap
+  crashes it. Reproduced deterministically. Root cause not yet
+  identified — see the recipe repo for current status before relying on
+  long-idle-then-serve workloads.
 
 ## Install
 
