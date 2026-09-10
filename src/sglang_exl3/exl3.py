@@ -1094,12 +1094,12 @@ def apply_exl3_fused_moe(
         ptrs["down_trellis"],
         ptrs["down_suh"],
         ptrs["down_svh"],
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
+        bool(getattr(layer, "_exl3_use_mcg", True)),
+        bool(getattr(layer, "_exl3_use_mul1", False)),
+        bool(getattr(layer, "_exl3_use_mcg", True)),
+        bool(getattr(layer, "_exl3_use_mul1", False)),
+        bool(getattr(layer, "_exl3_use_mcg", True)),
+        bool(getattr(layer, "_exl3_use_mul1", False)),
         float(limit),
     )
     if n_active_host is not None:
@@ -1596,7 +1596,11 @@ class EXL3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         w13_mcg = Parameter(
-            torch.full((num_experts, 2, 1), MCG_MARKER_SIGNED_INT32, dtype=torch.int32),
+            torch.zeros((num_experts, 2, 1), dtype=torch.int32),
+            requires_grad=False,
+        )
+        w13_mul1 = Parameter(
+            torch.zeros((num_experts, 2, 1), dtype=torch.int32),
             requires_grad=False,
         )
 
@@ -1613,7 +1617,11 @@ class EXL3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         w2_mcg = Parameter(
-            torch.full((num_experts, 1), MCG_MARKER_SIGNED_INT32, dtype=torch.int32),
+            torch.zeros((num_experts, 1), dtype=torch.int32),
+            requires_grad=False,
+        )
+        w2_mul1 = Parameter(
+            torch.zeros((num_experts, 1), dtype=torch.int32),
             requires_grad=False,
         )
 
@@ -1622,10 +1630,12 @@ class EXL3MoEMethod(FusedMoEMethodBase):
             "w13_suh": w13_suh,
             "w13_svh": w13_svh,
             "w13_mcg": w13_mcg,
+            "w13_mul1": w13_mul1,
             "w2_trellis": w2_trellis,
             "w2_suh": w2_suh,
             "w2_svh": w2_svh,
             "w2_mcg": w2_mcg,
+            "w2_mul1": w2_mul1,
         }
         for name, param in packed.items():
             layer.register_parameter(name, param)
@@ -1677,7 +1687,14 @@ class EXL3MoEMethod(FusedMoEMethodBase):
         else:
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 
+        # mcg/mul1 markers are 0-d scalars in checkpoints; packed dest is (1,).
+        if suffix in ("mcg", "mul1") and sharded.numel() == 1 and dest.numel() == 1:
+            dest.view(-1)[0] = sharded.reshape(-1)[0].to(dest.dtype)
+            return True if return_success else None
         if tuple(dest.shape) != tuple(sharded.shape):
+            if sharded.numel() == dest.numel():
+                dest.copy_(sharded.reshape(dest.shape))
+                return True if return_success else None
             raise RuntimeError(
                 f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
                 f"expert={expert_id}: dest {tuple(dest.shape)} != loaded {tuple(sharded.shape)}"
@@ -1693,44 +1710,101 @@ class EXL3MoEMethod(FusedMoEMethodBase):
             "w13_suh",
             "w13_svh",
             "w13_mcg",
+            "w13_mul1",
             "w2_trellis",
             "w2_suh",
             "w2_svh",
             "w2_mcg",
+            "w2_mul1",
         ):
-            getattr(layer, name)._exl3_owner = layer
+            if hasattr(layer, name):
+                getattr(layer, name)._exl3_owner = layer
 
+        # Detect codebook from loaded markers. Checkpoints are exclusively mcg OR mul1.
+        mul1_13 = layer.w13_mul1.reshape(-1) if hasattr(layer, "w13_mul1") else None
+        mul1_2 = layer.w2_mul1.reshape(-1) if hasattr(layer, "w2_mul1") else None
         mcg13 = layer.w13_mcg.reshape(-1)
         mcg2 = layer.w2_mcg.reshape(-1)
-        if not torch.all(mcg13 == MCG_MARKER_SIGNED_INT32) or not torch.all(mcg2 == MCG_MARKER_SIGNED_INT32):
-            logger.info(
-                "EXL3 mcg marker not present in checkpoint; normalizing to %s for packed ABI compatibility",
-                MCG_MARKER_SIGNED_INT32,
+        n_mul1 = int(((mul1_13 != 0).sum() if mul1_13 is not None else 0) + ((mul1_2 != 0).sum() if mul1_2 is not None else 0))
+        n_mcg = int((mcg13 != 0).sum() + (mcg2 != 0).sum())
+        cfg_cb = str(getattr(self.quant_config, "codebook", "mcg") or "mcg")
+        if n_mul1 > 0 and n_mcg == 0:
+            use_mul1, use_mcg = True, False
+        elif n_mcg > 0 and n_mul1 == 0:
+            use_mul1, use_mcg = False, True
+        elif n_mul1 > 0 and n_mcg > 0:
+            # Prefer whatever quant_config says; default mul1 if both somehow set
+            use_mul1 = cfg_cb == "mul1"
+            use_mcg = not use_mul1
+            logger.warning(
+                "EXL3 MoE saw both mcg (%s) and mul1 (%s) markers; using codebook=%s",
+                n_mcg, n_mul1, "mul1" if use_mul1 else "mcg",
             )
-            layer.w13_mcg.fill_(MCG_MARKER_SIGNED_INT32)
-            layer.w2_mcg.fill_(MCG_MARKER_SIGNED_INT32)
+        else:
+            # Nothing loaded — fall back to quant_config (default was historically mcg)
+            use_mul1 = cfg_cb == "mul1"
+            use_mcg = not use_mul1
+            logger.warning(
+                "EXL3 MoE markers missing (mcg=0 mul1=0); falling back to quant_config.codebook=%s",
+                cfg_cb,
+            )
+
+        if use_mcg:
+            if not torch.all(mcg13 == MCG_MARKER_SIGNED_INT32) or not torch.all(mcg2 == MCG_MARKER_SIGNED_INT32):
+                layer.w13_mcg.fill_(MCG_MARKER_SIGNED_INT32)
+                layer.w2_mcg.fill_(MCG_MARKER_SIGNED_INT32)
+        if use_mul1:
+            if mul1_13 is None or not torch.all(mul1_13 == MUL1_MARKER_SIGNED_INT32) or not torch.all(mul1_2 == MUL1_MARKER_SIGNED_INT32):
+                layer.w13_mul1.fill_(MUL1_MARKER_SIGNED_INT32)
+                layer.w2_mul1.fill_(MUL1_MARKER_SIGNED_INT32)
+
+        layer._exl3_use_mul1 = bool(use_mul1)
+        layer._exl3_use_mcg = bool(use_mcg)
 
         n_exp = int(layer.w13_trellis.shape[0])
         inners: list[dict[str, Any]] = []
         for e in range(n_exp):
-            gate = make_linear_exl3(
-                layer.w13_trellis[e, 0],
-                layer.w13_suh[e, 0],
-                layer.w13_svh[e, 0],
-                layer.w13_mcg[e, 0],
-            )
-            up = make_linear_exl3(
-                layer.w13_trellis[e, 1],
-                layer.w13_suh[e, 1],
-                layer.w13_svh[e, 1],
-                layer.w13_mcg[e, 1],
-            )
-            down = make_linear_exl3(
-                layer.w2_trellis[e],
-                layer.w2_suh[e],
-                layer.w2_svh[e],
-                layer.w2_mcg[e],
-            )
+            if use_mul1:
+                gate = make_linear_exl3(
+                    layer.w13_trellis[e, 0],
+                    layer.w13_suh[e, 0],
+                    layer.w13_svh[e, 0],
+                    None,
+                    layer.w13_mul1[e, 0],
+                )
+                up = make_linear_exl3(
+                    layer.w13_trellis[e, 1],
+                    layer.w13_suh[e, 1],
+                    layer.w13_svh[e, 1],
+                    None,
+                    layer.w13_mul1[e, 1],
+                )
+                down = make_linear_exl3(
+                    layer.w2_trellis[e],
+                    layer.w2_suh[e],
+                    layer.w2_svh[e],
+                    None,
+                    layer.w2_mul1[e],
+                )
+            else:
+                gate = make_linear_exl3(
+                    layer.w13_trellis[e, 0],
+                    layer.w13_suh[e, 0],
+                    layer.w13_svh[e, 0],
+                    layer.w13_mcg[e, 0],
+                )
+                up = make_linear_exl3(
+                    layer.w13_trellis[e, 1],
+                    layer.w13_suh[e, 1],
+                    layer.w13_svh[e, 1],
+                    layer.w13_mcg[e, 1],
+                )
+                down = make_linear_exl3(
+                    layer.w2_trellis[e],
+                    layer.w2_suh[e],
+                    layer.w2_svh[e],
+                    layer.w2_mcg[e],
+                )
             inners.append({"gate": gate, "up": up, "down": down})
         layer._exl3_inners = inners
 
@@ -1743,13 +1817,14 @@ class EXL3MoEMethod(FusedMoEMethodBase):
 
         if not self._logged:
             logger.info(
-                "EXL3 MCG trellis engaged for SGLang routed experts: bits=%s "
-                "experts_local=%s hidden=%s intermediate_local=%s backend=%s",
+                "EXL3 trellis engaged for SGLang routed experts: bits=%s "
+                "experts_local=%s hidden=%s intermediate_local=%s backend=%s codebook=%s",
                 self.bits,
                 n_exp,
                 layer._exl3_hidden_size,
                 layer._exl3_intermediate_local,
                 backend,
+                "mul1" if getattr(layer, "_exl3_use_mul1", False) else "mcg",
             )
             self._logged = True
 
