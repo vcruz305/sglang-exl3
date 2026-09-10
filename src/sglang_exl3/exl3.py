@@ -1341,6 +1341,10 @@ class EXL3Config(QuantizationConfig):
         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
+        _mb = config.get("mtp_bits", None)
+        if _mb is None:
+            _mb = config.get("bits", inst.bits)
+        inst.mtp_bits = int(_mb) if _mb is not None else int(inst.bits)
         return inst
 
     @classmethod
@@ -1383,6 +1387,10 @@ class EXL3Config(QuantizationConfig):
         )
         if is_moe_layer:
             if is_draft_layer:
+                # Qwen Flash Next EXL3 ships EXL3 MTP packs (mtp_bits). Prefer native EXL3 draft.
+                if os.environ.get("SGLANG_EXL3_MTP_EXL3", "1") == "1":
+                    bits = getattr(self, "mtp_bits", None) or self.bits_for_prefix(prefix)
+                    return EXL3MoEMethod(self, bits=int(bits))
                 if os.environ.get("SGLANG_EXL3_MTP_FP8", "1") == "1":
                     d = self._draft_delegate()
                     if d is not None and hasattr(d, "get_quant_method"):
@@ -1395,7 +1403,6 @@ class EXL3Config(QuantizationConfig):
                             return Fp8MoEMethod(d)
                     except Exception:
                         pass
-                # When MTP FP8 is disabled or unavailable, draft MoE layers remain unquantized (BF16), never EXL3
                 return None
 
             if getattr(self, "mtp_experts", "") == "source":
@@ -1433,6 +1440,12 @@ class EXL3Config(QuantizationConfig):
                 return EXL3LinearMethod(self, bits=bits)
 
             if is_draft_layer:
+                if os.environ.get("SGLANG_EXL3_MTP_EXL3", "1") == "1":
+                    if self._matches_non_routed_exl3(prefix):
+                        bits = self._bits_for_non_routed(prefix)
+                    else:
+                        bits = getattr(self, "mtp_bits", None) or self.bits_for_prefix(prefix)
+                    return EXL3LinearMethod(self, bits=int(bits))
                 if os.environ.get("SGLANG_EXL3_MTP_FP8", "1") == "1":
                     d = self._draft_delegate()
                     if d is not None:
@@ -1446,7 +1459,6 @@ class EXL3Config(QuantizationConfig):
                                 return Fp8LinearMethod(d)
                         except Exception:
                             pass
-                # Draft linears remain unquantized BF16 when MTP FP8 is disabled
                 return None
 
             # Non-draft (target) linear layers
