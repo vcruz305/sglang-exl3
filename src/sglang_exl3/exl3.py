@@ -1466,10 +1466,13 @@ class EXL3Config(QuantizationConfig):
                     return dm
             return None
 
+        # Token embeddings are BF16 / PLE-backed, never an EXL3 trellis.
+        if "embed_tokens" in prefix_lower or layer_cls_name == "VocabParallelEmbedding":
+            return None
+
         is_lm_head = (
             "lm_head" in prefix_lower
             or "ParallelLMHead" in layer_cls_name
-            or "VocabParallelEmbedding" in layer_cls_name
         )
         is_linear = (
             is_lm_head
