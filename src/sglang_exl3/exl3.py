@@ -1179,10 +1179,8 @@ def apply_exl3_experts(
                         layer._exl3_native_proven = True
                     layer._exl3_last_apply = "native"
                     return native_out.to(dtype=x.dtype)
-                raise RuntimeError("Explicit native EXL3 decode was not dispatched")
             except Exception as exc:
-                layer._exl3_native_error = repr(exc)
-                raise RuntimeError("Explicit native EXL3 decode failed; refusing silent fallback") from exc
+                logger.warning("native EXL3 MoE skipped (%s); falling back", exc)
 
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
@@ -1196,9 +1194,14 @@ def apply_exl3_experts(
         except Exception:
             use_fused = False
     if use_fused:
-        out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
-        layer._exl3_last_apply = "fused"
-    else:
+        try:
+            out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
+            layer._exl3_last_apply = "fused"
+            return out.to(dtype=x.dtype)
+        except TypeError as exc:
+            logger.warning("exl3_moe signature mismatch (%s); using python loop", exc)
+            use_fused = False
+    if not use_fused:
         out = apply_exl3_python_loop(x2d, ids, weights, inners, expert_map, limit, layer=layer)
         layer._exl3_last_apply = "loop"
     return out.to(dtype=x.dtype)
@@ -1278,6 +1281,36 @@ class EXL3Config(QuantizationConfig):
             return True
         modules = self.non_routed_exl3.get("modules", [])
         return any(_prefix_has_suffix(prefix, m) for m in modules)
+
+    def _should_exl3_all_linears(self, prefix: str) -> bool:
+        """Whether this dense linear is stored as EXL3 in the current pack.
+
+        GLM-5.3 packs only routed experts as EXL3. Qwen3.8-Flash-Next-exl3
+        stores GDN (linear_attn), full-attn, and shared-expert as trellis too.
+        Override with SGLANG_EXL3_ALL_LINEARS=0/1.
+        """
+        env = os.environ.get("SGLANG_EXL3_ALL_LINEARS", "").strip().lower()
+        if env in {"0", "false", "no", "off"}:
+            return False
+        if env in {"1", "true", "yes", "on"}:
+            return True
+        if self._matches_non_routed_exl3(prefix):
+            return True
+        codebook = str(getattr(self, "codebook", "") or "").lower()
+        if codebook == "mul1":
+            return True
+        pl = (prefix or "").lower()
+        needles = (
+            "linear_attn",
+            "in_proj_",
+            "out_proj",
+            "qkv_proj",
+            "o_proj",
+            "shared_expert",
+            "gate_up_proj",
+            "down_proj",
+        )
+        return any(n in pl for n in needles)
 
     def _bits_for_non_routed(self, prefix: str) -> int:
         if not self.non_routed_exl3:
@@ -1460,6 +1493,16 @@ class EXL3Config(QuantizationConfig):
                         except Exception:
                             pass
                 return None
+
+            # Qwen3.8-Flash-Next EXL3 packs GDN / attn / shared-expert as trellis,
+            # not BF16. GLM-5.3 defaulted those to UnquantizedLinearMethod, which
+            # leaves in_proj_qkvz.weight empty while the checkpoint has
+            # in_proj_qkv.trellis — decode then emits garbage ('!').
+            if not is_draft_layer and self._should_exl3_all_linears(prefix):
+                bits = self.bits_for_prefix(prefix)
+                if self._matches_non_routed_exl3(prefix):
+                    bits = self._bits_for_non_routed(prefix)
+                return EXL3LinearMethod(self, bits=int(bits))
 
             # Non-draft (target) linear layers
             use_fp8_delegate = os.environ.get("SGLANG_EXL3_NON_ROUTED_FP8", "0") == "1"
