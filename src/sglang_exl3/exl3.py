@@ -456,16 +456,24 @@ def make_linear_exl3(
     *,
     out_dtype: torch.dtype = torch.float16,
 ):
+    def _align(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None:
+            return None
+        t = t.contiguous()
+        if t.data_ptr() % 256 != 0:
+            t = t.clone()
+        return t
+
     cls = load_linear_exl3_cls()
     return cls(
         config=None,
         in_features=int(suh.numel()),
         out_features=int(svh.numel()),
-        trellis=trellis.contiguous(),
-        suh=suh.contiguous(),
-        svh=svh.contiguous(),
-        mcg=mcg.contiguous() if mcg is not None else None,
-        mul1=mul1.contiguous() if mul1 is not None else None,
+        trellis=_align(trellis),
+        suh=_align(suh),
+        svh=_align(svh),
+        mcg=_align(mcg),
+        mul1=_align(mul1),
         out_dtype=out_dtype,
         transformers_fix=True,
     )
@@ -1296,19 +1304,20 @@ class EXL3Config(QuantizationConfig):
             return True
         if self._matches_non_routed_exl3(prefix):
             return True
-        codebook = str(getattr(self, "codebook", "") or "").lower()
-        if codebook == "mul1":
-            return True
+        # Do not treat codebook=mul1 as "every linear": Qwen packs keep
+        # in_proj_a/b and conv1d as .weight (BF16) while qkv/GDN are trellis.
         pl = (prefix or "").lower()
         needles = (
-            "linear_attn",
-            "in_proj_",
+            "in_proj_qkvz",
+            "in_proj_qkv",
+            "in_proj_z.",
+            ".in_proj_z",
             "out_proj",
             "qkv_proj",
             "o_proj",
             "shared_expert",
             "gate_up_proj",
-            "down_proj",
+            "lm_head",
         )
         return any(n in pl for n in needles)
 
@@ -2053,6 +2062,13 @@ class EXL3LinearMethod(LinearMethodBase):
                 return
             if dest.numel() == src.numel():
                 dest.copy_(src.reshape(dest.shape))
+            elif suffix == "trellis":
+                # Mixed-K packs (e.g. 3.05bpw_h5): GDN qkv trellis is K=5
+                # (k_words=80) while create_weights used config bits=3 (48).
+                # Allocate a fresh aligned buffer; mmap views crash coop_autotune.
+                aligned = torch.empty(src.shape, dtype=torch.int16, device=dest.device)
+                aligned.copy_(src.to(dtype=torch.int16, device=dest.device).reshape(src.shape))
+                merged[suffix] = aligned
             elif suffix == "suh" and src.ndim == 1 and dest.numel() == src.numel():
                 dest.copy_(src.to(dest.dtype))
             elif src.numel() == 1:
@@ -2074,6 +2090,12 @@ class EXL3LinearMethod(LinearMethodBase):
             pack["filled"] = True
             return
         if dest.numel() != src.numel():
+            if suffix == "trellis":
+                aligned = torch.empty(src.shape, dtype=torch.int16, device=dest.device)
+                aligned.copy_(src.to(dtype=torch.int16, device=dest.device).reshape(src.shape))
+                pack[suffix] = aligned
+                pack["filled"] = True
+                return
             raise RuntimeError(f"EXL3 linear {suffix} shard={shard_id} dest {tuple(dest.shape)} vs {tuple(src.shape)}")
         dest.copy_(src.reshape(dest.shape))
         pack["filled"] = True
