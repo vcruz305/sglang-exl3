@@ -37,8 +37,10 @@ if CUDA_HOME:
             ],
             include_dirs=include_dirs,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17"],
+                # Torch 2.14+ headers (ExpandUtils / autograd) need C++20.
+                # c++17 fails to parse at::symint::sizes on GB10 / cu130.
+                "cxx": ["-O3", "-std=c++20"],
+                "nvcc": ["-O3", "-std=c++20", "-gencode=arch=compute_121a,code=sm_121a"],
             },
         )
     ]

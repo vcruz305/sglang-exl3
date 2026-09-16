@@ -35,8 +35,13 @@ def patch_quantization_methods() -> bool:
         return False
 
 
+def _append_choice(seq, value: str) -> None:
+    if seq is not None and value not in seq:
+        seq.append(value)
+
+
 def patch_server_args() -> bool:
-    """Add 'exl3' to SGLang's QUANTIZATION_CHOICES CLI options."""
+    """Add 'exl3' / 'exl3_mmap' to SGLang CLI choice lists (current and legacy homes)."""
     try:
         from sglang.srt import server_args as sa
 
@@ -46,6 +51,15 @@ def patch_server_args() -> bool:
                     sa.add_quantization_method_choices(["exl3"])
                 else:
                     sa.QUANTIZATION_CHOICES.append("exl3")
+        if hasattr(sa, "LOAD_FORMAT_CHOICES"):
+            _append_choice(sa.LOAD_FORMAT_CHOICES, "exl3_mmap")
+        try:
+            from sglang.srt.arg_groups import choices as agc
+
+            _append_choice(getattr(agc, "QUANTIZATION_CHOICES", None), "exl3")
+            _append_choice(getattr(agc, "LOAD_FORMAT_CHOICES", None), "exl3_mmap")
+        except (ImportError, AttributeError):
+            pass
         return True
     except (ImportError, AttributeError) as exc:
         logger.debug("Failed to patch SGLang QUANTIZATION_CHOICES: %s", exc)
