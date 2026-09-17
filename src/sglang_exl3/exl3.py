@@ -426,15 +426,17 @@ def fused_moe_enabled() -> bool:
     return os.environ.get("EXL3_FUSED_MOE", "1") != "0"
 
 
-def _exl3_moe_accepts_num_active(fn) -> bool:
-    try:
-        import inspect
-        if "num_active" in inspect.signature(fn).parameters:
-            return True
-    except (TypeError, ValueError):
-        pass
-    doc = getattr(fn, "__doc__", None) or ""
-    return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
+_EXL3_MOE_NARGS: int | None = None
+
+
+def _exl3_moe_nargs(fn) -> int:
+    global _EXL3_MOE_NARGS
+    if _EXL3_MOE_NARGS is None:
+        import re
+        doc = getattr(fn, "__doc__", "") or ""
+        argn = [int(x) for x in re.findall(r"arg(\d+)", doc)]
+        _EXL3_MOE_NARGS = max(argn) if argn else 28
+    return _EXL3_MOE_NARGS
 
 
 def _install_exllamav3_namespace() -> None:
@@ -1077,7 +1079,6 @@ def apply_exl3_fused_moe(
         return out
 
     fn = exllamav3_ext.exl3_moe
-    n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
     k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
     args = (
         xh,
@@ -1110,8 +1111,11 @@ def apply_exl3_fused_moe(
         bool(getattr(layer, "_exl3_use_mul1", False)),
         float(limit),
     )
-    if n_active_host is not None:
-        fn(*args, n_active_host)
+    n_args = _exl3_moe_nargs(fn)
+    if n_args >= 34:
+        fn(*args, -1, None, None, 1, 16, 16)
+    elif n_args >= 29:
+        fn(*args, -1)
     else:
         fn(*args)
 
