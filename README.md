@@ -68,7 +68,7 @@ hardware notes, and the investigation trail behind the numbers.
 | Model | Quant | Layout | MTP / speculative | Decode tok/s | Recipe |
 | --- | --- | --- | --- | --- | --- |
 | GLM-5.3-Flash-EXL3-K2 | EXL3, ~91 GiB | 45 layers: 34 KDA linear-attn + 11 DSA full-attn, 288 routed experts / 8 active | k=2–16 MTP | ~16 tok/s @ 8k ctx | [vLLM recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) · [SGLang recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe) |
-| Qwen3.8-Flash-Next-EXL3 | EXL3, 3.05 bpw, ~87 GiB | `Qwen4ExpForConditionalGeneration` (`model_type: qwen4_exp`), QSA sparse attention | EAGLE/MTP, native-EXL3 draft (`steps=3 topk=1 draft_tokens=4`) | **~22–31 tok/s with MTP** (peak 35), **~17 tok/s baseline (no MTP)** | [SGLang recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-SGLang-DGX-Spark-recipe) · [vLLM recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe) |
+| Qwen3.8-Flash-Next-EXL3 | EXL3, 3.05 bpw, ~87 GiB | `Qwen4ExpForConditionalGeneration` (`model_type: qwen4_exp`), QSA sparse attention | EAGLE/MTP 3/1/4 + ReplaySSM, fused `exl3_moe` | **~35 tok/s** (`n=256`, ctx 4096); ~10 tok/s if MoE falls back to the python loop | [SGLang recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-SGLang-DGX-Spark-recipe) · [vLLM recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe) |
 
 **Qwen4Exp / Qwen3.8-Flash-Next details:**
 
@@ -77,12 +77,11 @@ hardware notes, and the investigation trail behind the numbers.
   merged `20bce5e`) — the earlier "not currently loadable" limitation
   (missing MoE codebook multiplier handling for routed EXL3 experts) is
   resolved.
-- EAGLE/MTP speculative decoding works via a second fix
-  ([PR #2](https://github.com/vcruz305/sglang-exl3/pull/2), merged) that
-  loads the MTP draft's MoE/linear layers as native EXL3 instead of
-  falling back to random-initialized dense/BF16 weights. Before this
-  fix: accept rate 0.00, accept len 1.00 (draft never contributed).
-  After: **accept rate 0.47–0.72, accept len 2.4–3.2**.
+- EAGLE/MTP speculative decoding needs PR #2 (native EXL3 draft) **and**
+  PR #3 (`fix/gb10-torch214-sglang-cli`): mixed-K GDN/`lm_head`, no EXL3
+  `embed_tokens`, 35-arg `exl3_moe`. After both: accept ~0.69 / len ~3.1,
+  **~35 tok/s** (`n=256`, ctx 4096) with ReplaySSM. Before embed-share:
+  accept 0.00. Before the 35-arg `exl3_moe` call: python loop, ~10–16 tok/s.
 - `speculative_eagle_topk` is **hard-capped at 1** for this architecture
   (`NotImplementedError` above that) — not a tunable flag, confirmed via
   direct testing of `topk=4`.
