@@ -426,15 +426,17 @@ def fused_moe_enabled() -> bool:
     return os.environ.get("EXL3_FUSED_MOE", "1") != "0"
 
 
-def _exl3_moe_accepts_num_active(fn) -> bool:
-    try:
-        import inspect
-        if "num_active" in inspect.signature(fn).parameters:
-            return True
-    except (TypeError, ValueError):
-        pass
-    doc = getattr(fn, "__doc__", None) or ""
-    return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
+_EXL3_MOE_NARGS: int | None = None
+
+
+def _exl3_moe_nargs(fn) -> int:
+    global _EXL3_MOE_NARGS
+    if _EXL3_MOE_NARGS is None:
+        import re
+        doc = getattr(fn, "__doc__", "") or ""
+        argn = [int(x) for x in re.findall(r"arg(\d+)", doc)]
+        _EXL3_MOE_NARGS = max(argn) if argn else 28
+    return _EXL3_MOE_NARGS
 
 
 def _install_exllamav3_namespace() -> None:
@@ -456,16 +458,24 @@ def make_linear_exl3(
     *,
     out_dtype: torch.dtype = torch.float16,
 ):
+    def _align(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None:
+            return None
+        t = t.contiguous()
+        if t.data_ptr() % 256 != 0:
+            t = t.clone()
+        return t
+
     cls = load_linear_exl3_cls()
     return cls(
         config=None,
         in_features=int(suh.numel()),
         out_features=int(svh.numel()),
-        trellis=trellis.contiguous(),
-        suh=suh.contiguous(),
-        svh=svh.contiguous(),
-        mcg=mcg.contiguous() if mcg is not None else None,
-        mul1=mul1.contiguous() if mul1 is not None else None,
+        trellis=_align(trellis),
+        suh=_align(suh),
+        svh=_align(svh),
+        mcg=_align(mcg),
+        mul1=_align(mul1),
         out_dtype=out_dtype,
         transformers_fix=True,
     )
@@ -1069,7 +1079,6 @@ def apply_exl3_fused_moe(
         return out
 
     fn = exllamav3_ext.exl3_moe
-    n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
     k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
     args = (
         xh,
@@ -1102,8 +1111,11 @@ def apply_exl3_fused_moe(
         bool(getattr(layer, "_exl3_use_mul1", False)),
         float(limit),
     )
-    if n_active_host is not None:
-        fn(*args, n_active_host)
+    n_args = _exl3_moe_nargs(fn)
+    if n_args >= 34:
+        fn(*args, -1, None, None, 1, 16, 16)
+    elif n_args >= 29:
+        fn(*args, -1)
     else:
         fn(*args)
 
@@ -1179,10 +1191,8 @@ def apply_exl3_experts(
                         layer._exl3_native_proven = True
                     layer._exl3_last_apply = "native"
                     return native_out.to(dtype=x.dtype)
-                raise RuntimeError("Explicit native EXL3 decode was not dispatched")
             except Exception as exc:
-                layer._exl3_native_error = repr(exc)
-                raise RuntimeError("Explicit native EXL3 decode failed; refusing silent fallback") from exc
+                logger.warning("native EXL3 MoE skipped (%s); falling back", exc)
 
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
@@ -1196,9 +1206,14 @@ def apply_exl3_experts(
         except Exception:
             use_fused = False
     if use_fused:
-        out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
-        layer._exl3_last_apply = "fused"
-    else:
+        try:
+            out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
+            layer._exl3_last_apply = "fused"
+            return out.to(dtype=x.dtype)
+        except TypeError as exc:
+            logger.warning("exl3_moe signature mismatch (%s); using python loop", exc)
+            use_fused = False
+    if not use_fused:
         out = apply_exl3_python_loop(x2d, ids, weights, inners, expert_map, limit, layer=layer)
         layer._exl3_last_apply = "loop"
     return out.to(dtype=x.dtype)
@@ -1278,6 +1293,37 @@ class EXL3Config(QuantizationConfig):
             return True
         modules = self.non_routed_exl3.get("modules", [])
         return any(_prefix_has_suffix(prefix, m) for m in modules)
+
+    def _should_exl3_all_linears(self, prefix: str) -> bool:
+        """Whether this dense linear is stored as EXL3 in the current pack.
+
+        GLM-5.3 packs only routed experts as EXL3. Qwen3.8-Flash-Next-exl3
+        stores GDN (linear_attn), full-attn, and shared-expert as trellis too.
+        Override with SGLANG_EXL3_ALL_LINEARS=0/1.
+        """
+        env = os.environ.get("SGLANG_EXL3_ALL_LINEARS", "").strip().lower()
+        if env in {"0", "false", "no", "off"}:
+            return False
+        if env in {"1", "true", "yes", "on"}:
+            return True
+        if self._matches_non_routed_exl3(prefix):
+            return True
+        # Do not treat codebook=mul1 as "every linear": Qwen packs keep
+        # in_proj_a/b and conv1d as .weight (BF16) while qkv/GDN are trellis.
+        pl = (prefix or "").lower()
+        needles = (
+            "in_proj_qkvz",
+            "in_proj_qkv",
+            "in_proj_z.",
+            ".in_proj_z",
+            "out_proj",
+            "qkv_proj",
+            "o_proj",
+            "shared_expert",
+            "gate_up_proj",
+            "lm_head",
+        )
+        return any(n in pl for n in needles)
 
     def _bits_for_non_routed(self, prefix: str) -> int:
         if not self.non_routed_exl3:
@@ -1424,10 +1470,13 @@ class EXL3Config(QuantizationConfig):
                     return dm
             return None
 
+        # Token embeddings are BF16 / PLE-backed, never an EXL3 trellis.
+        if "embed_tokens" in prefix_lower or layer_cls_name == "VocabParallelEmbedding":
+            return None
+
         is_lm_head = (
             "lm_head" in prefix_lower
             or "ParallelLMHead" in layer_cls_name
-            or "VocabParallelEmbedding" in layer_cls_name
         )
         is_linear = (
             is_lm_head
@@ -1460,6 +1509,16 @@ class EXL3Config(QuantizationConfig):
                         except Exception:
                             pass
                 return None
+
+            # Qwen3.8-Flash-Next EXL3 packs GDN / attn / shared-expert as trellis,
+            # not BF16. GLM-5.3 defaulted those to UnquantizedLinearMethod, which
+            # leaves in_proj_qkvz.weight empty while the checkpoint has
+            # in_proj_qkv.trellis — decode then emits garbage ('!').
+            if not is_draft_layer and self._should_exl3_all_linears(prefix):
+                bits = self.bits_for_prefix(prefix)
+                if self._matches_non_routed_exl3(prefix):
+                    bits = self._bits_for_non_routed(prefix)
+                return EXL3LinearMethod(self, bits=int(bits))
 
             # Non-draft (target) linear layers
             use_fp8_delegate = os.environ.get("SGLANG_EXL3_NON_ROUTED_FP8", "0") == "1"
@@ -2010,6 +2069,13 @@ class EXL3LinearMethod(LinearMethodBase):
                 return
             if dest.numel() == src.numel():
                 dest.copy_(src.reshape(dest.shape))
+            elif suffix == "trellis":
+                # Mixed-K packs (e.g. 3.05bpw_h5): GDN qkv trellis is K=5
+                # (k_words=80) while create_weights used config bits=3 (48).
+                # Allocate a fresh aligned buffer; mmap views crash coop_autotune.
+                aligned = torch.empty(src.shape, dtype=torch.int16, device=dest.device)
+                aligned.copy_(src.to(dtype=torch.int16, device=dest.device).reshape(src.shape))
+                merged[suffix] = aligned
             elif suffix == "suh" and src.ndim == 1 and dest.numel() == src.numel():
                 dest.copy_(src.to(dest.dtype))
             elif src.numel() == 1:
@@ -2031,6 +2097,12 @@ class EXL3LinearMethod(LinearMethodBase):
             pack["filled"] = True
             return
         if dest.numel() != src.numel():
+            if suffix == "trellis":
+                aligned = torch.empty(src.shape, dtype=torch.int16, device=dest.device)
+                aligned.copy_(src.to(dtype=torch.int16, device=dest.device).reshape(src.shape))
+                pack[suffix] = aligned
+                pack["filled"] = True
+                return
             raise RuntimeError(f"EXL3 linear {suffix} shard={shard_id} dest {tuple(dest.shape)} vs {tuple(src.shape)}")
         dest.copy_(src.reshape(dest.shape))
         pack["filled"] = True
