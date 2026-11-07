@@ -324,11 +324,11 @@ class EXL3LinearMethod(LinearMethodBase):
                 x2 = x2.to(torch.float16).contiguous()
 
         n = len(linears)
-        # The fused exl3_mgemm pair path is opt-in (SGLANG_EXL3_MGEMM=1) pending
-        # correctness sign-off; per-linear exl3_gemm is the default.
+        # The fused exl3_mgemm pair path is on by default (SGLANG_EXL3_MGEMM=1);
+        # per-linear exl3_gemm remains the fallback.
         use_fused = (
             rows <= _MGEMM_MAX_ROWS
-            and os.environ.get("SGLANG_EXL3_MGEMM", "0") == "1"
+            and os.environ.get("SGLANG_EXL3_MGEMM", "1") != "0"
         )
         if n == 2 and use_fused and _mgemm_pair_compatible(linears[0], linears[1]):
             # Merged gate_up_proj: one fused 2-matrix GEMM, then concat.
@@ -376,7 +376,7 @@ class EXL3LinearMethod(LinearMethodBase):
         k_lin, v_lin = linears[1], linears[2]
         fused = (
             rows <= _MGEMM_MAX_ROWS
-            and os.environ.get("SGLANG_EXL3_MGEMM", "0") == "1"
+            and os.environ.get("SGLANG_EXL3_MGEMM", "1") != "0"
             and _mgemm_pair_compatible(k_lin, v_lin)
         )
         if fused:
@@ -386,9 +386,8 @@ class EXL3LinearMethod(LinearMethodBase):
             v = v_lin.forward(x2, {}, out_dtype=torch.float16)
         out_dtype = getattr(layer, "_exl3_out_dtype", x.dtype)
         k, v = k.to(out_dtype), v.to(out_dtype)
-        # fp16->fp16 is a no-op that would return views into the shared mgemm
-        # workspace (overwritten by the next layer); clone in that case. bf16
-        # conversion already allocates a fresh tensor.
+        # fp16->fp16 is a no-op; mgemm returns fresh tensors, so the clone
+        # below is only a cheap safety net (bf16 conversion already allocates).
         if out_dtype == torch.float16 and fused:
             k, v = k.clone(), v.clone()
         if len(orig_shape) > 2:
