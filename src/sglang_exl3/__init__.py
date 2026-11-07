@@ -37,11 +37,18 @@ def register() -> None:
 
     patch.apply_all_patches()
     try:
+        from .models import dflash_exl3, ricursive  # noqa: F401
+
+        dflash_exl3.patch_dflash_draft_exl3()
+    except Exception:
+        pass
+    try:
         ops.register_custom_ops()
     except Exception:
         pass
     try:
         from . import speculative
+
         speculative.EXL3SpeculativeHook.apply_hooks()
     except Exception:
         pass
