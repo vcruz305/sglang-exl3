@@ -88,10 +88,13 @@ def _get_mgemm_ptrs(layer, lin0, lin1, dev) -> dict[str, Any]:
     return entry
 
 
-def _mgemm_two(layer, x2, lin0, lin1):
+def _mgemm_two(layer, x2, lin0, lin1, x2_b=None):
     """Fused 2-matrix EXL3 GEMM over a shared input.
 
-    x2: (rows, in_f) fp16 contiguous. Returns (out0, out1) each (rows, out_f).
+    x2: (rows, in_f) fp16 contiguous. x2_b: optional second (rows, in_f)
+    fp16 tensor for the second linear (e.g. k/v under a value residual); when
+    None (or identical to x2) both linears read x2. Returns (out0, out1),
+    each (rows, out_f), freshly allocated (no aliasing across calls).
     """
     ext = _load_exllamav3_ext()
     dev = x2.device
@@ -99,9 +102,13 @@ def _mgemm_two(layer, x2, lin0, lin1):
     out_f = lin0.out_features
     ptrs = _get_mgemm_ptrs(layer, lin0, lin1, dev)
     ws = _get_workspace(dev, 2 * rows * in_f, 2 * rows * out_f)
-    xv = x2.view(1, rows, in_f)
+    xv = (
+        x2.view(1, rows, in_f)
+        if (x2_b is None or x2_b is x2)
+        else torch.stack([x2, x2_b], dim=0)
+    )
     ahad = ws["had_flat"][: 2 * rows * in_f].view(2, rows, in_f)
-    out = ws["out_flat"][: 2 * rows * out_f].view(2, rows, out_f)
+    out = torch.empty((2, rows, out_f), dtype=torch.float16, device=dev)
     ext.exl3_mgemm(
         xv, ptrs["trellis"], out, ptrs["suh"], ahad, ptrs["svh"],
         None, None, lin0.K, -1, lin0.mcg, lin0.mul1, -1, -1, 0, 1,

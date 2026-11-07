@@ -40,8 +40,8 @@ from transformers import PretrainedConfig
 
 from ..dense import _mgemm_pair_compatible, _mgemm_two
 
-# Fused 2-matrix EXL3 GEMM (q+g, k+v, gate+up) is opt-in until sign-off.
-_FUSE_MGEMM = os.environ.get("SGLANG_EXL3_MGEMM", "0") == "1"
+# Fused 2-matrix EXL3 GEMM (q+g, k+v, gate+up) is on by default.
+_FUSE_MGEMM = os.environ.get("SGLANG_EXL3_MGEMM", "1") != "0"
 _MGEMM_MAX_ROWS = 32
 
 
@@ -244,7 +244,7 @@ class RicursiveAttention(nn.Module):
 
         # Single fp16 conversion for the whole attention block.
         h16 = hidden_states.to(torch.float16).contiguous() if hidden_states.dtype != torch.float16 else hidden_states.contiguous()
-        v16 = value_input.to(torch.float16).contiguous() if value_input.dtype != torch.float16 else value_input.contiguous()
+        v16 = h16 if value_input is hidden_states else (value_input.to(torch.float16).contiguous() if value_input.dtype != torch.float16 else value_input.contiguous())
 
         ql = _exl3_lines(self.q_proj)[0]
         gl = _exl3_lines(self.g_proj)[0] if self.g_proj is not None else None
@@ -262,11 +262,11 @@ class RicursiveAttention(nn.Module):
             if self.g_proj is not None:
                 gate, _ = self.g_proj(h16)
 
-        # (k, v) share h16 when no value residual -> 1 fused GEMM.
-        if fuse and v16 is h16 and _mgemm_pair_compatible(kl, vl):
-            k, v = _mgemm_two(self.k_proj, h16, kl, vl)
-            # mgemm returns views into the shared workspace; copy v to bf16 so
-            # the KV-cache store (and attention dtype check) sees bf16.
+        # (k, v) read h16 / v16 -> 1 fused GEMM across all layers (incl. value residual).
+        if fuse and _mgemm_pair_compatible(kl, vl):
+            k, v = _mgemm_two(self.k_proj, h16, kl, vl, x2_b=v16)
+            # mgemm returns fresh tensors; copy v to bf16 so the KV-cache store
+            # (and attention dtype check) sees bf16.
             v = v.to(torch.bfloat16)
         else:
             k, _ = self.k_proj(h16)
