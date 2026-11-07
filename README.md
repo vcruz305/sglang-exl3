@@ -14,7 +14,9 @@ investigation trail behind those numbers), see the separate recipe repo
 for that model — e.g.
 [`GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe`](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe)
 for GLM-5.3-Flash-EXL3-K2, or the model-coverage table below for all
-tested models.
+tested models. Ripple-65B-Preview with DFlash2 speculative decoding has
+its own recipe repo:
+[`Ripple-65B-Preview-EXL3-SGLang-recipe`](https://github.com/vcruz305/Ripple-65B-Preview-EXL3-SGLang-recipe).
 
 ## What this plugin provides
 
@@ -69,6 +71,7 @@ hardware notes, and the investigation trail behind the numbers.
 | --- | --- | --- | --- | --- | --- |
 | GLM-5.3-Flash-EXL3-K2 | EXL3, ~91 GiB | 45 layers: 34 KDA linear-attn + 11 DSA full-attn, 288 routed experts / 8 active | k=2–16 MTP | ~16 tok/s @ 8k ctx | [vLLM recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) · [SGLang recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-SGLang-DGX-Spark-recipe) |
 | Qwen3.8-Flash-Next-EXL3 | EXL3, 3.05 bpw, ~87 GiB | `Qwen4ExpForConditionalGeneration` (`model_type: qwen4_exp`), QSA sparse attention | EAGLE/MTP, native-EXL3 draft (`steps=3 topk=1 draft_tokens=4`) | **~22–31 tok/s with MTP** (peak 35), **~17 tok/s baseline (no MTP)** | [SGLang recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-SGLang-DGX-Spark-recipe) · [vLLM recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe) |
+| Ripple-65B-Preview-SAGE-REXL3 | SAGE-REXL3, 5.41 bpw, ~43 GB | `RicursiveForCausalLM`: 80 layers, hybrid full-attn (every 5th) + sliding-window (1024), NoPE, value residuals, PeriNorm | DFlash2 draft — EXL3 `4.55bpw` (recommended) / `3.60bpw` / `3.08bpw`, or BF16 (`num_draft_tokens=16`) | **~64.8 tok/s greedy** / **~53.1 tok/s t=0.6** decode, **~1,800 tok/s prefill**, accept len 2.05–3.55, 117,376-token full KV pool on 1× RTX PRO 6000 96 GB | [SGLang recipe](https://github.com/vcruz305/Ripple-65B-Preview-EXL3-SGLang-recipe) |
 
 **Qwen4Exp / Qwen3.8-Flash-Next details:**
 
@@ -97,6 +100,14 @@ hardware notes, and the investigation trail behind the numbers.
   crashes it. Reproduced deterministically. Root cause not yet
   identified — see the recipe repo for current status before relying on
   long-idle-then-serve workloads.
+
+**Ripple / Ripple-65B-Preview + DFlash2 details:**
+
+- Adds `RicursiveForCausalLM` — quantization-aware Ripple target (separate `q/k/v/g/gate/up` projections, PeriNorm decoder, sliding-window + NoPE with full attention every 5th layer, value residuals) — and `DFlash2DraftModel` EXL3/BF16 draft support (`src/sglang_exl3/models/ricursive.py`, `src/sglang_exl3/models/dflash_exl3.py`). Measured on SGLang `0.5.19`, one RTX PRO 6000 Blackwell 96 GB (`sm_120`), with the `5.41bpw` SAGE target + `4.55bpw` EXL3 DFlash2 draft: **~64.8 tok/s greedy decode** (44.9 @ 1,564-token prompt, 49.3 @ 3,152), **~53.1 tok/s at `t=0.6`** (41.2 / 51.3), cold prefill **~1,096–1,802 tok/s**, DFlash accept len **2.05–3.55**, and 117,376 full-attention / 93,888 SWA KV tokens at `--mem-fraction-static 0.82` with the 16-token DFlash block.
+- The DFlash2 draft packs (`vcruz305/Ripple-65B-Preview-DFlash2-SAGE-REXL3` at `4.55`/`3.60`/`3.08bpw`, plus BF16) load as native EXL3 trellis groups; the BF16 draft's stacked `q/k/v → qkv_proj` and `gate/up → gate_up_proj` weights are mapped in `dflash_exl3.py`'s `load_weights`. Skipping that map collapses acceptance to 1.00 (~19.4 tok/s).
+- Draft `fc` and `down_proj` use selective FP32 dynamic scaling (`_exl3_scale_input`); omitting it overflows FP16 on long prompts (accept len 1.00). The 80-layer target's 640 linears pay zero scaling cost.
+- `SGLANG_EXL3_MGEMM=1` (default) fuses `(q_proj, g_proj)` (80/80 layers), `(k_proj, v_proj)` with value residuals (80/80 layers), `(gate_proj, up_proj)` (79/80 layers), and the draft's `gate_up_proj` + k/v shards into multi-matrix `exl3_mgemm` launches (cos ≈ 0.9999998 vs per-linear reference). The 1D-flat contiguous CUDA-graph workspace never reallocates during capture.
+- Full launch flags, tuning knobs, SixCat eval tables, and troubleshooting live in the [Ripple-65B-Preview-EXL3-SGLang-recipe](https://github.com/vcruz305/Ripple-65B-Preview-EXL3-SGLang-recipe) repo (pin `5d1c9ef`).
 
 ## Install
 
