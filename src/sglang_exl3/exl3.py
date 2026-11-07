@@ -1337,6 +1337,10 @@ class EXL3Config(QuantizationConfig):
             non_routed_exl3=config.get("non_routed_exl3"),
             **{k: v for k, v in config.items() if k not in skip},
         )
+        # Configs that only declare quant_method=exl3 (e.g. dense SAGE-REXL3
+        # packs) are dense models: quantize every linear, not just routed MoE.
+        if "scope" not in config and str(config.get("quant_method", "")).lower() == "exl3":
+            inst.scope = "dense_and_moe"
         inst.non_routed_quantization = config.get("non_routed_quantization")
         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
@@ -1427,15 +1431,38 @@ class EXL3Config(QuantizationConfig):
         is_lm_head = (
             "lm_head" in prefix_lower
             or "ParallelLMHead" in layer_cls_name
-            or "VocabParallelEmbedding" in layer_cls_name
         )
+        is_embedding = "VocabParallelEmbedding" in layer_cls_name and not is_lm_head
+        if is_embedding:
+            # Embedding tables stay BF16 in SAGE-REXL3 packs.
+            return None
         is_linear = (
             is_lm_head
             or (LinearBase is not None and isinstance(layer, LinearBase))
             or "Linear" in layer_cls_name
         )
         if is_linear:
+            dense_enabled = (
+                self.scope in ("dense_and_moe", "dense")
+                or os.environ.get("SGLANG_EXL3_DENSE", "0") == "1"
+            )
+            nr = self.non_routed_exl3 or {}
+            bf16_modules = nr.get("bf16_modules", []) or []
+            if any(_prefix_has_suffix(prefix, m) for m in bf16_modules):
+                try:
+                    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+                    return UnquantizedLinearMethod()
+                except Exception:
+                    return None
+            if dense_enabled and not is_draft_layer:
+                from .dense import EXL3LinearMethod
+
+                return EXL3LinearMethod(self, bits=self.bits_for_prefix(prefix))
+
             if not is_draft_layer and self._matches_non_routed_exl3(prefix):
+                from .dense import EXL3LinearMethod
+
                 bits = self._bits_for_non_routed(prefix)
                 return EXL3LinearMethod(self, bits=bits)
 
@@ -1904,208 +1931,8 @@ class EXL3MoEMethod(FusedMoEMethodBase):
         return out
 
 
-class EXL3LinearMethod(LinearMethodBase):
-    """SGLang linear method for dense non-routed projections quantized with EXL3."""
+# EXL3LinearMethod moved to .dense (bitwidth-agnostic, graph-safe buffer
+# variant). Re-exported here for backward compatibility with callers that
+# import it from this module.
+from .dense import EXL3DenseLinear, EXL3LinearMethod  # noqa: E402,F401
 
-    def __init__(self, quant_config: EXL3Config, bits: int | None = None) -> None:
-        super().__init__()
-        self.quant_config = quant_config
-        self.bits = int(bits) if bits is not None else quant_config.bits
-        self._logged = False
-
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        n_shards = len(output_partition_sizes)
-        k_words = self.bits * 16
-        for i, out_size in enumerate(output_partition_sizes):
-            if input_size_per_partition % 16 or out_size % 16:
-                raise ValueError(
-                    f"EXL3 trellis tiles are 16-wide; "
-                    f"shard {i}: in={input_size_per_partition} out={out_size}"
-                )
-        in_tiles = input_size_per_partition // 16
-        extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
-        packs = []
-        for i, out_size in enumerate(output_partition_sizes):
-            pack = {
-                "trellis": torch.empty(in_tiles, out_size // 16, k_words, dtype=torch.int16),
-                "suh": torch.empty(input_size_per_partition, dtype=torch.float16),
-                "svh": torch.empty(out_size, dtype=torch.float16),
-                "mcg": torch.zeros(1, dtype=torch.int32),
-                "mul1": torch.zeros(1, dtype=torch.int32),
-                "filled": False,
-                "skip": False,
-            }
-            packs.append(pack)
-        layer._exl3_lin_packs = packs
-        layer._exl3_lin_merged = {}
-        dummy = {
-            "trellis": Parameter(torch.empty(in_tiles, sum(s // 16 for s in output_partition_sizes), k_words, dtype=torch.int16), requires_grad=False),
-            "suh": Parameter(torch.empty(n_shards, input_size_per_partition, dtype=torch.float16), requires_grad=False),
-            "svh": Parameter(torch.empty(sum(output_partition_sizes), dtype=torch.float16), requires_grad=False),
-            "mcg": Parameter(torch.zeros(n_shards, 1, dtype=torch.int32), requires_grad=False),
-            "mul1": Parameter(torch.zeros(n_shards, 1, dtype=torch.int32), requires_grad=False),
-        }
-        for sname, p in dummy.items():
-            layer.register_parameter(sname, p)
-            set_weight_attrs(p, extra)
-            p.weight_loader = self._load_linear
-            p._exl3_owner = layer
-            p._exl3_suffix = sname
-        layer._exl3_linear_input_size_per_partition = input_size_per_partition
-        layer._exl3_linear_output_partition_sizes = list(output_partition_sizes)
-        layer._exl3_linear_k_words = k_words
-        layer._exl3_linear_bits = self.bits
-
-    def _shard_index(self, shard_id):
-        if shard_id is None:
-            return None
-        if isinstance(shard_id, str) and shard_id in ("q", "k", "v"):
-            return {"q": 0, "k": 1, "v": 2}[shard_id]
-        return shard_id
-
-    def _load_linear(self, param, loaded_weight, shard_id=None):
-        layer = getattr(param, "_exl3_owner", None)
-        suffix = getattr(param, "_exl3_suffix", None)
-        src = loaded_weight.detach().contiguous()
-        if layer is None or suffix is None:
-            if param.numel() == src.numel():
-                param.data.copy_(src.reshape(param.shape))
-            return
-        packs = layer._exl3_lin_packs
-        sizes = layer._exl3_linear_output_partition_sizes
-        idx = self._shard_index(shard_id)
-        if idx is None:
-            idx = 0 if len(packs) == 1 else None
-        if isinstance(idx, tuple):
-            start, end = min(idx), max(idx) + 1
-            key = (start, end)
-            merged = layer._exl3_lin_merged.setdefault(key, {})
-            out = sum(sizes[start:end])
-            in_size = layer._exl3_linear_input_size_per_partition
-            k_words = layer._exl3_linear_k_words
-            in_tiles = in_size // 16
-            if suffix == "trellis" and "trellis" not in merged:
-                merged["trellis"] = torch.empty(in_tiles, out // 16, k_words, dtype=torch.int16, device=src.device)
-            if suffix == "suh" and "suh" not in merged:
-                merged["suh"] = torch.empty(in_size, dtype=torch.float16, device=src.device)
-            if suffix == "svh" and "svh" not in merged:
-                merged["svh"] = torch.empty(out, dtype=torch.float16, device=src.device)
-            dest = merged.get(suffix)
-            if dest is None:
-                if src.numel() == 1:
-                    merged[suffix] = src.reshape(1).to(torch.int32).cpu()
-                    for j in range(start, end):
-                        packs[j]["skip"] = True
-                    return
-                return
-            if dest.numel() == src.numel():
-                dest.copy_(src.reshape(dest.shape))
-            elif suffix == "suh" and src.ndim == 1 and dest.numel() == src.numel():
-                dest.copy_(src.to(dest.dtype))
-            elif src.numel() == 1:
-                dest.fill_(src.reshape(()).item())
-            else:
-                raise RuntimeError(f"EXL3 merged {suffix} {tuple(dest.shape)} vs {tuple(src.shape)} shard={shard_id}")
-            for j in range(start, end):
-                packs[j]["skip"] = True
-            merged["filled"] = True
-            return
-        i = int(idx)
-        pack = packs[i]
-        dest = pack[suffix]
-        if src.numel() == 1:
-            pack[suffix] = src.reshape(1).to(dest.dtype) if suffix in ("mcg", "mul1") else dest
-            if suffix in ("mcg", "mul1"):
-                pack[suffix].fill_(src.reshape(()).item()) if dest.numel() == 1 else None
-                pack[suffix] = torch.tensor([src.reshape(()).item()], dtype=torch.int32)
-            pack["filled"] = True
-            return
-        if dest.numel() != src.numel():
-            raise RuntimeError(f"EXL3 linear {suffix} shard={shard_id} dest {tuple(dest.shape)} vs {tuple(src.shape)}")
-        dest.copy_(src.reshape(dest.shape))
-        pack["filled"] = True
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not hasattr(layer, "_exl3_lin_packs"):
-            return
-        linears = []
-        used = set()
-        for (start, end), merged in sorted(layer._exl3_lin_merged.items()):
-            if "trellis" not in merged:
-                continue
-            mcg = merged.get("mcg")
-            mul1 = merged.get("mul1")
-            mcg_t = mcg if mcg is not None and mcg.numel() and mcg.reshape(-1)[0].item() != 0 else None
-            mul1_t = mul1 if mul1 is not None and mul1.numel() and mul1.reshape(-1)[0].item() != 0 else None
-            linears.append(
-                make_linear_exl3(
-                    merged["trellis"].contiguous(),
-                    merged["suh"].contiguous(),
-                    merged["svh"].contiguous(),
-                    mcg_t,
-                    mul1_t,
-                    out_dtype=torch.float16,
-                )
-            )
-            used.update(range(start, end))
-        for i, pack in enumerate(layer._exl3_lin_packs):
-            if i in used or pack.get("skip") or not pack.get("filled"):
-                if i not in used:
-                    linears.append(None)
-                continue
-            mcg = pack["mcg"]
-            mul1 = pack["mul1"]
-            mcg_t = mcg if mcg.numel() and int(mcg.reshape(-1)[0]) != 0 else None
-            mul1_t = mul1 if mul1.numel() and int(mul1.reshape(-1)[0]) != 0 else None
-            linears.append(
-                make_linear_exl3(
-                    pack["trellis"].contiguous(),
-                    pack["suh"].contiguous(),
-                    pack["svh"].contiguous(),
-                    mcg_t,
-                    mul1_t,
-                    out_dtype=torch.float16,
-                )
-            )
-        layer._exl3_linears = [x for x in linears if x is not None]
-        for param_name in ("trellis", "suh", "svh", "mcg", "mul1"):
-            if hasattr(layer, param_name):
-                try:
-                    delattr(layer, param_name)
-                except Exception:
-                    pass
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        linears = getattr(layer, "_exl3_linears", None)
-        if not linears:
-            raise RuntimeError("EXL3 linear layers were not built after weight load")
-        orig_shape = x.shape
-        if len(orig_shape) > 2:
-            rows = math.prod(orig_shape[:-1])
-            x_2d = x.reshape(rows, orig_shape[-1])
-        else:
-            x_2d = x
-        x_fp16 = x_2d.to(torch.float16).contiguous()
-        outputs = [lin.forward(x_fp16, {}, out_dtype=torch.float32) for lin in linears]
-        y = torch.cat(outputs, dim=1) if len(outputs) > 1 else outputs[0]
-        y = y.to(dtype=x.dtype)
-        if bias is not None:
-            y = y + bias
-        if len(orig_shape) > 2:
-            y = y.reshape(*orig_shape[:-1], y.shape[-1])
-        return y
