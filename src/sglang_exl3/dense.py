@@ -186,11 +186,14 @@ class EXL3LinearMethod(LinearMethodBase):
                 )
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
         layer._exl3_out_dtype = params_dtype or torch.bfloat16
-        # DFlash2's candidate selector requires lm_head.weight to exist;
-        # keep a non-dense placeholder so should_apply_lm_head_quant_method
-        # routes to our quant_method.apply instead of the dense matmul path.
-        # Only for ParallelLMHead, never for the actual embedding table.
-        if layer.__class__.__name__ == "ParallelLMHead" and not hasattr(layer, "weight"):
+        # Empty placeholder `weight` for every EXL3 linear (the trellis packs live in exl3_* params).
+        # - DFlash2's candidate selector requires lm_head.weight to exist; keeping this placeholder
+        #   makes should_apply_lm_head_quant_method route to our quant_method.apply.
+        # - SGLang's GLM/DeepSeek MoE constructor (models/deepseek_v2.py, shared-expert block) reads
+        #   gate_up_proj.weight / .qweight only to test its dtype (int8 / fp8) and raises
+        #   "shared expert gate/up projection has no weight storage" when neither exists.
+        # The placeholder is never loaded from a checkpoint and apply() never reads it.
+        if not hasattr(layer, "weight"):
             layer.register_parameter(
                 "weight", Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
             )
