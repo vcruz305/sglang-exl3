@@ -1244,6 +1244,38 @@ def _tensor_storage_kinds(tensor_storage: Any) -> dict[str, str]:
 _NATIVE_STORAGE_LOGGED: set[str] = set()
 
 
+def _tensor_storage_bits(tensor_storage: Any) -> tuple[dict[str, int], dict[int, int]]:
+    """Per-module EXL3 bits and per-layer expert bits from tensor_storage trellis shapes.
+
+    bits = trellis last dim / 16 (the trellis packs 16 * bits words per group). Experts must be
+    uniform within a layer because the MoE kernel stacks them; a mixed layer fails closed.
+    """
+    module_bits: dict[str, int] = {}
+    layer_bits: dict[int, int] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        name = str(module)
+        for tensor_name, meta in stored.items():
+            if not str(tensor_name).endswith(".trellis"):
+                continue
+            shape = (meta or {}).get("shape") or []
+            if not shape:
+                continue  # no recorded shape: leave bits to the config fallback
+            if int(shape[-1]) % 16 != 0:
+                raise ValueError(f"bad trellis shape for {name}: {shape}")
+            bits = int(shape[-1]) // 16
+            module_bits[name] = bits
+            module_bits[name.replace("model.language_model.", "model.", 1)] = bits
+            if ".experts." in name:
+                m = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+                if m is not None:
+                    layer = int(m.group(1))
+                    prev = layer_bits.setdefault(layer, bits)
+                    if prev != bits:
+                        raise ValueError(f"mixed expert bits in layer {layer}: {prev} vs {bits}")
+    return module_bits, layer_bits
+
+
 class EXL3Config(QuantizationConfig):
     """SGLang quantization config for native sm_121 Blackwell EXL3/MCG models."""
 
@@ -1290,9 +1322,18 @@ class EXL3Config(QuantizationConfig):
     _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
     def bits_for_prefix(self, prefix: str) -> int:
+        # Stored trellis width is the source of truth for mixed packs: a linear's bits are its
+        # trellis last dim / 16, and experts are uniform per layer.
+        storage_bits = getattr(self, "tensor_storage_bits", None) or {}
+        if prefix in storage_bits:
+            return storage_bits[prefix]
+        m = self._LAYER_RE.search(prefix or "")
+        if m is not None:
+            layer_storage = getattr(self, "storage_layer_bits", None) or {}
+            if int(m.group(1)) in layer_storage:
+                return layer_storage[int(m.group(1))]
         if not self.layer_bits:
             return self.bits
-        m = self._LAYER_RE.search(prefix or "")
         if m is None:
             return self.bits
         return self.layer_bits.get(int(m.group(1)), self.bits)
@@ -1373,6 +1414,7 @@ class EXL3Config(QuantizationConfig):
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
         inst.tensor_storage_kinds = _tensor_storage_kinds(config.get("tensor_storage"))
+        inst.tensor_storage_bits, inst.storage_layer_bits = _tensor_storage_bits(config.get("tensor_storage"))
         _mb = config.get("mtp_bits", None)
         if _mb is None:
             _mb = config.get("bits", inst.bits)
