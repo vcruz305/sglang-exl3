@@ -1,20 +1,19 @@
-"""Sub-15s Zero-Copy Unified Memory MMap Fast Loader for SGLang EXL3 on NVIDIA DGX Spark GB10.
+"""EXL3 shard loader for SGLang on NVIDIA DGX Spark GB10 (128 GiB unified memory).
 
-Optimized for coherent Grace Blackwell NVLink-C2C Unified Memory (128 GiB):
-- Multi-threaded concurrent shard memory mapping.
-- Asynchronous producer-consumer pipeline with pre-faulting (POSIX_MADV_WILLNEED).
-- Zero-copy tensor wrapping directly into device/unified memory address space.
-- Sub-15s loading target for 83.4 GiB DeepSeek-V4 shards.
+Streams safetensors shards with pread() one tensor at a time and drops each
+file range from the page cache after reading, so host memory peaks at about
+1.0x the weight bytes (not 2x). Loading is sequential by design; see
+``exl3_mmap_weights_iterator``.
 """
 
 from __future__ import annotations
 
-import ctypes
+import json
 import logging
 import os
+import struct
 import sys
 import time
-from queue import Queue
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -63,6 +62,112 @@ def madvise_file_preload(file_path: str) -> bool:
         return False
 
 
+_SAFETENSORS_DTYPES: Dict[str, torch.dtype] = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "BOOL": torch.bool,
+}
+if hasattr(torch, "float8_e4m3fn"):
+    _SAFETENSORS_DTYPES["F8_E4M3"] = torch.float8_e4m3fn
+if hasattr(torch, "float8_e5m2"):
+    _SAFETENSORS_DTYPES["F8_E5M2"] = torch.float8_e5m2
+
+_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", 4)
+
+
+def _drop_file_pages(fd: int, offset: int = 0, length: int = 0) -> None:
+    """Best-effort: drop clean page-cache pages for a file range."""
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, offset, length, _FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+def host_memory_summary(device: Union[str, torch.device, None] = None) -> str:
+    """One-line host/GPU memory snapshot for load-time logging."""
+    mem_avail_gib = float("nan")
+    swap_used_mib = float("nan")
+    try:
+        fields: Dict[str, int] = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in ("MemAvailable", "SwapTotal", "SwapFree"):
+                    fields[key] = int(rest.split()[0])  # kB
+        mem_avail_gib = fields["MemAvailable"] / (1024 ** 2)
+        swap_used_mib = (fields["SwapTotal"] - fields["SwapFree"]) / 1024
+    except (OSError, KeyError, ValueError):
+        pass
+    cuda_gib = float("nan")
+    try:
+        if torch.cuda.is_available():
+            cuda_gib = torch.cuda.memory_allocated() / (1024 ** 3)
+    except Exception:
+        pass
+    return (
+        f"MemAvailable={mem_avail_gib:.2f}GiB swap_used={swap_used_mib:.0f}MiB "
+        f"cuda_allocated={cuda_gib:.2f}GiB"
+    )
+
+
+def iter_safetensors_pread(path: str) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Stream one safetensors shard tensor-by-tensor with pread() (no mmap).
+
+    Why: an mmap'd shard keeps its file pages in the page cache while the CUDA
+    copies accumulate. On GB10 unified memory both count against the same 128 GiB,
+    so the load cost ~2x the weight bytes (measured: page cache grew 1:1 with the
+    bytes read, and it was not released before the next shard).
+
+    Each tensor gets a fresh buffer that is freed once the consumer drops it, and
+    the file range is dropped from the page cache right after it is read.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        (header_len,) = struct.unpack("<Q", os.pread(fd, 8, 0))
+        header = json.loads(os.pread(fd, header_len, 8))
+        header.pop("__metadata__", None)
+        base = 8 + header_len
+        for name, info in sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0]):
+            dtype_name = info["dtype"]
+            if dtype_name not in _SAFETENSORS_DTYPES:
+                raise RuntimeError(
+                    f"[EXL3 MMap Loader] unsupported safetensors dtype {dtype_name} for {name} in {path}"
+                )
+            dtype = _SAFETENSORS_DTYPES[dtype_name]
+            shape = tuple(info["shape"])
+            start, end = info["data_offsets"]
+            nbytes = end - start
+            if nbytes == 0:
+                yield name, torch.empty(shape, dtype=dtype)
+                continue
+            offset = base + start
+            buf = bytearray(nbytes)
+            view = memoryview(buf)
+            got = 0
+            while got < nbytes:
+                n = os.preadv(fd, [view[got:]], offset + got)
+                if n <= 0:
+                    raise IOError(f"[EXL3 MMap Loader] short read in {path} at {name}: {got}/{nbytes} bytes")
+                got += n
+            view.release()
+            _drop_file_pages(fd, offset, nbytes)
+            tensor = torch.frombuffer(buf, dtype=dtype).reshape(shape)
+            del buf
+            yield name, tensor
+            del tensor
+    finally:
+        _drop_file_pages(fd)
+        os.close(fd)
+
+
 def exl3_mmap_weights_iterator(
     hf_weights_files: List[str],
     device: Union[str, torch.device] = "cpu",
@@ -70,52 +175,23 @@ def exl3_mmap_weights_iterator(
     prefetch_shards: int = 2,
     drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over safetensors model weights using concurrent mmap and direct memory mapping.
+    """Iterate over safetensors weights without keeping shard mmaps or page cache.
+
+    Shards are read sequentially with pread() (see ``iter_safetensors_pread``).
+    ``num_threads``, ``prefetch_shards`` and ``drop_cache_after_load`` are accepted
+    for API compatibility; the page cache is always released after each read,
+    because parallel readers and a resident page cache were the cause of the
+    ~2x host-memory peak on unified-memory GB10.
 
     Args:
-        hf_weights_files: List of paths to safetensors checkpoint files.
-        device: Target torch device ('cuda:0', 'cuda', or 'cpu').
-        num_threads: Number of background threads for parallel shard readahead and opening.
-        prefetch_shards: Max shards to buffer in memory ahead of consumption.
-        drop_cache_after_load: Whether to advise kernel to drop file pages after loading.
+        hf_weights_files: Paths to safetensors checkpoint shards, in load order.
+        device: Target device the consumer copies into (informational).
     """
-    import safetensors
-    from safetensors.torch import safe_open
-
-    device_str = str(device) if not isinstance(device, str) else device
-    enable_cuda_direct = torch.cuda.is_available() and device_str.startswith("cuda")
-    unified_mem = is_unified_memory_platform()
-
     total_files = len(hf_weights_files)
     if total_files == 0:
         return
 
-    # Background prefetch queue for shard file contexts
-    shard_queue: Queue[Any] = Queue(maxsize=max(2, prefetch_shards))
-    stop_sentinel = object()
-    producer_err: list[Exception] = []
-
-    def _producer():
-        try:
-            for filepath in hf_weights_files:
-                # GB10 UMA: never WILLNEED-stampede, never cuda-direct open.
-                target_dev = "cpu"
-                try:
-                    handle = safe_open(filepath, framework="pt", device=target_dev)
-                except Exception:
-                    # Fallback to cpu if direct device mapping fails
-                    handle = safe_open(filepath, framework="pt", device="cpu")
-                shard_queue.put((filepath, handle))
-        except Exception as exc:
-            logger.error(f"[EXL3 MMap Loader] Error in prefetch thread: {exc}")
-            producer_err.append(exc)
-        finally:
-            shard_queue.put(stop_sentinel)
-
-    from threading import Thread
-    producer_thread = Thread(target=_producer, daemon=True)
-    producer_thread.start()
-
+    unified_mem = is_unified_memory_platform()
     total_bytes = 0
     total_tensors = 0
     start_time = time.perf_counter()
@@ -126,37 +202,30 @@ def exl3_mmap_weights_iterator(
         desc=f"EXL3 MMap Loading ({'Unified sm_121' if unified_mem else 'Zero-Copy'})",
         disable=not enable_tqdm,
     )
-
     try:
-        while True:
-            item = shard_queue.get()
-            if item is stop_sentinel:
-                if producer_err:
-                    raise RuntimeError(
-                        f"[EXL3 MMap Loader] Shard prefetch failed: {producer_err[0]}"
-                    ) from producer_err[0]
-                break
-            filepath, handle = item
-            try:
-                for key in handle.keys():
-                    tensor = handle.get_tensor(key)
-                    total_bytes += tensor.nbytes
-                    total_tensors += 1
-                    yield key, tensor
-            finally:
-                pbar.update(1)
-                del handle
+        for index, filepath in enumerate(hf_weights_files, start=1):
+            shard_tensors = 0
+            for key, tensor in iter_safetensors_pread(filepath):
+                total_bytes += tensor.nbytes
+                total_tensors += 1
+                shard_tensors += 1
+                yield key, tensor
+            pbar.update(1)
+            logger.info(
+                "[EXL3 MMap Loader] shard %d/%d %s tensors=%d %s",
+                index, total_files, os.path.basename(filepath), shard_tensors,
+                host_memory_summary(device),
+            )
     finally:
         pbar.close()
         elapsed = time.perf_counter() - start_time
         total_gb = total_bytes / (1024 ** 3)
         throughput = (total_gb / elapsed) if elapsed > 0 else 0.0
         logger.info(
-            f"[EXL3 MMap Loader] Successfully mapped {total_tensors} tensors "
+            f"[EXL3 MMap Loader] Successfully read {total_tensors} tensors "
             f"({total_gb:.2f} GiB) across {total_files} shards in {elapsed:.2f}s "
-            f"({throughput:.2f} GB/s effective throughput)."
+            f"({throughput:.2f} GB/s effective throughput). {host_memory_summary(device)}"
         )
-
 
 try:
     from sglang.srt.model_loader.loader import DefaultModelLoader, LoadConfig
