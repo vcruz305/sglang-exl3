@@ -109,10 +109,12 @@ def _mgemm_two(layer, x2, lin0, lin1, x2_b=None):
     )
     ahad = ws["had_flat"][: 2 * rows * in_f].view(2, rows, in_f)
     out = torch.empty((2, rows, out_f), dtype=torch.float16, device=dev)
+    # Argument layout matches exllamav3 modules/mlp.py + attn.py (18 positional args). The binding
+    # rejects anything longer ("incompatible function arguments" at CUDA-graph capture).
     ext.exl3_mgemm(
         xv, ptrs["trellis"], out, ptrs["suh"], ahad, ptrs["svh"],
         None, None, lin0.K, -1, lin0.mcg, lin0.mul1, -1, -1, 0, 1,
-        None, None, None, None, 0,
+        None, None,
     )
     return out[0], out[1]
 
@@ -162,6 +164,9 @@ class EXL3LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.bits = int(bits) if bits is not None else int(quant_config.bits)
         self._logged = False
+        # Per-child output widths when SGLang fuses separately stored children into one linear
+        # (set by EXL3Config.get_quant_method for e.g. fused_qkv_a_proj_with_mqa).
+        self.split_sizes: Optional[list[int]] = None
 
     # ------------------------------------------------------------------
     # weight creation / loading
@@ -177,6 +182,9 @@ class EXL3LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        split = getattr(self, "split_sizes", None)
+        if split and len(output_partition_sizes) == 1 and sum(split) == output_partition_sizes[0]:
+            output_partition_sizes = [int(x) for x in split]
         n_shards = len(output_partition_sizes)
         for out_size in output_partition_sizes:
             if input_size_per_partition % 16 or out_size % 16:

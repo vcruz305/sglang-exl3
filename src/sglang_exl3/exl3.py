@@ -1243,6 +1243,54 @@ def _tensor_storage_kinds(tensor_storage: Any) -> dict[str, str]:
 
 _NATIVE_STORAGE_LOGGED: set[str] = set()
 
+# Merged SGLang modules whose checkpoint tensors are stored per child projection.
+_MERGED_STORAGE_CHILDREN = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+}
+
+
+def storage_kind_for_prefix(kinds: dict[str, str], prefix: str) -> Optional[str]:
+    """tensor_storage kind for a module prefix, resolving merged modules via their children.
+
+    A merged module (e.g. ``mlp.gate_up_proj``) has no tensor_storage entry of its own when the
+    pack stores ``gate_proj`` / ``up_proj``. If its children are EXL3 the merged module is EXL3.
+    """
+    kind = kinds.get(prefix)
+    if kind is not None:
+        return kind
+    leaf = prefix.rsplit(".", 1)[-1]
+    children = _MERGED_STORAGE_CHILDREN.get(leaf)
+    if not children:
+        return None
+    parent = prefix[: len(prefix) - len(leaf)]
+    child_kinds = {kinds.get(parent + c) for c in children} - {None}
+    if child_kinds == {"exl3"}:
+        return "exl3"
+    if child_kinds == {"native"}:
+        return "native"
+    if child_kinds:
+        raise RuntimeError(f"EXL3 storage: merged module {prefix} has mixed child kinds {sorted(str(k) for k in child_kinds)}")
+    return None
+
+
+def _tensor_storage_out_sizes(tensor_storage: Any) -> dict[str, int]:
+    """Output width per EXL3 module from its stored trellis shape: trellis = [in/16, out/16, 16*bits]."""
+    out: dict[str, int] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        name = str(module)
+        for tensor_name, meta in stored.items():
+            if not str(tensor_name).endswith(".trellis"):
+                continue
+            shape = (meta or {}).get("shape") or []
+            if len(shape) != 3:
+                continue
+            width = int(shape[1]) * 16
+            out[name] = width
+            out[name.replace("model.language_model.", "model.", 1)] = width
+    return out
+
 
 def _tensor_storage_bits(tensor_storage: Any) -> tuple[dict[str, int], dict[int, int]]:
     """Per-module EXL3 bits and per-layer expert bits from tensor_storage trellis shapes.
@@ -1311,6 +1359,7 @@ class EXL3Config(QuantizationConfig):
         self.raw_config = dict(kwargs)
         # Per-module storage kinds from the checkpoint's tensor_storage (set by from_config).
         self.tensor_storage_kinds: dict[str, str] = {}
+        self.tensor_storage_out_sizes: dict[str, int] = {}
         if self.codebook not in ("mcg", "mul1"):
             raise ValueError(f"unsupported codebook={self.codebook!r}; must be 'mcg' or 'mul1'")
         if self.bits not in (2, 3, 4, 5, 6):
@@ -1320,6 +1369,23 @@ class EXL3Config(QuantizationConfig):
         return "exl3"
 
     _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+    def merged_split_sizes(self, prefix: str) -> Optional[list[int]]:
+        """Per-child output widths for a merged module stored as separate EXL3 children.
+
+        SGLang may build e.g. fused_qkv_a_proj_with_mqa as ONE linear (out = q_a + kv_a) while the
+        pack stores q_a_proj and kv_a_proj_with_mqa separately. Returns [q_a_out, kv_a_out] so the
+        linear gets one EXL3 shard per child. None when the prefix is not such a module.
+        """
+        leaf = (prefix or "").rsplit(".", 1)[-1]
+        children = _MERGED_STORAGE_CHILDREN.get(leaf)
+        if not children:
+            return None
+        parent = prefix[: len(prefix) - len(leaf)]
+        sizes = [self.tensor_storage_out_sizes.get(parent + c) for c in children]
+        if any(x is None for x in sizes):
+            return None
+        return [int(x) for x in sizes]
 
     def bits_for_prefix(self, prefix: str) -> int:
         # Stored trellis width is the source of truth for mixed packs: a linear's bits are its
@@ -1414,6 +1480,7 @@ class EXL3Config(QuantizationConfig):
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
         inst.tensor_storage_kinds = _tensor_storage_kinds(config.get("tensor_storage"))
+        inst.tensor_storage_out_sizes = _tensor_storage_out_sizes(config.get("tensor_storage"))
         inst.tensor_storage_bits, inst.storage_layer_bits = _tensor_storage_bits(config.get("tensor_storage"))
         _mb = config.get("mtp_bits", None)
         if _mb is None:
@@ -1528,7 +1595,7 @@ class EXL3Config(QuantizationConfig):
             # Checkpoint storage decides the target linears of a mixed pack: a module whose stored
             # tensors are a plain .weight stays native BF16. A module with no tensor_storage entry
             # also counts as native (for this pack every non-expert EXL3 target linear is listed).
-            if not is_draft_layer and self.tensor_storage_kinds and self.tensor_storage_kinds.get(prefix) != "exl3":
+            if not is_draft_layer and self.tensor_storage_kinds and storage_kind_for_prefix(self.tensor_storage_kinds, prefix) != "exl3":
                 if prefix not in _NATIVE_STORAGE_LOGGED:
                     _NATIVE_STORAGE_LOGGED.add(prefix)
                     logger.info(
@@ -1545,7 +1612,9 @@ class EXL3Config(QuantizationConfig):
             if dense_enabled and not is_draft_layer:
                 from .dense import EXL3LinearMethod
 
-                return EXL3LinearMethod(self, bits=self.bits_for_prefix(prefix))
+                method = EXL3LinearMethod(self, bits=self.bits_for_prefix(prefix))
+                method.split_sizes = self.merged_split_sizes(prefix)
+                return method
 
             if not is_draft_layer and self._matches_non_routed_exl3(prefix):
                 from .dense import EXL3LinearMethod
