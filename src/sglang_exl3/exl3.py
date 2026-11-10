@@ -1219,6 +1219,26 @@ def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
     return prefix == suffix or prefix.endswith("." + suffix)
 
 
+def _tensor_storage_kinds(tensor_storage: Any) -> dict[str, str]:
+    """Map module prefix -> "exl3" | "native" from quantization_config.json tensor_storage.
+
+    A module whose stored tensors include ``.trellis`` is EXL3; any other module with stored
+    tensors (a plain ``.weight``, e.g. the router gate or GDN/MLA projections in mixed packs) is
+    native BF16. Entries with no stored tensors are skipped.
+    """
+    kinds: dict[str, str] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        if not stored:
+            continue
+        is_exl3 = any(str(name).endswith(".trellis") for name in stored)
+        kinds[str(module)] = "exl3" if is_exl3 else "native"
+    return kinds
+
+
+_NATIVE_STORAGE_LOGGED: set[str] = set()
+
+
 class EXL3Config(QuantizationConfig):
     """SGLang quantization config for native sm_121 Blackwell EXL3/MCG models."""
 
@@ -1252,6 +1272,8 @@ class EXL3Config(QuantizationConfig):
             raise ValueError(f"unsupported non_routed_exl3 codebook={nr_codebook!r}")
 
         self.raw_config = dict(kwargs)
+        # Per-module storage kinds from the checkpoint's tensor_storage (set by from_config).
+        self.tensor_storage_kinds: dict[str, str] = {}
         if self.codebook not in ("mcg", "mul1"):
             raise ValueError(f"unsupported codebook={self.codebook!r}; must be 'mcg' or 'mul1'")
         if self.bits not in (2, 3, 4, 5, 6):
@@ -1345,6 +1367,7 @@ class EXL3Config(QuantizationConfig):
         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
+        inst.tensor_storage_kinds = _tensor_storage_kinds(config.get("tensor_storage"))
         _mb = config.get("mtp_bits", None)
         if _mb is None:
             _mb = config.get("bits", inst.bits)
@@ -1449,6 +1472,23 @@ class EXL3Config(QuantizationConfig):
             nr = self.non_routed_exl3 or {}
             bf16_modules = nr.get("bf16_modules", []) or []
             if any(_prefix_has_suffix(prefix, m) for m in bf16_modules):
+                try:
+                    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+                    return UnquantizedLinearMethod()
+                except Exception:
+                    return None
+            # Checkpoint storage decides the target linears of a mixed pack: a module whose stored
+            # tensors are a plain .weight stays native BF16. A module with no tensor_storage entry
+            # also counts as native (for this pack every non-expert EXL3 target linear is listed).
+            if not is_draft_layer and self.tensor_storage_kinds and self.tensor_storage_kinds.get(prefix) != "exl3":
+                if prefix not in _NATIVE_STORAGE_LOGGED:
+                    _NATIVE_STORAGE_LOGGED.add(prefix)
+                    logger.info(
+                        "EXL3 storage: %s -> native (tensor_storage kind=%s)",
+                        prefix,
+                        self.tensor_storage_kinds.get(prefix, "absent"),
+                    )
                 try:
                     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
