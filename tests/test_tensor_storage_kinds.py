@@ -26,6 +26,20 @@ class TestTensorStorageKinds(unittest.TestCase):
         self.assertNotIn("hc_expand", kinds)
         self.assertEqual(_tensor_storage_kinds(None), {})
 
+    def test_language_model_prefix_is_indexed_as_sglang_prefix(self):
+        ts = {
+            "model.language_model.layers.3.self_attn.q_b_proj": {
+                "stored_tensors": {"model.language_model.layers.3.self_attn.q_b_proj.trellis": {}}
+            },
+            "model.language_model.layers.3.self_attn.indexer.weights_proj": {
+                "stored_tensors": {"model.language_model.layers.3.self_attn.indexer.weights_proj.weight": {}}
+            },
+        }
+        kinds = _tensor_storage_kinds(ts)
+        self.assertEqual(kinds["model.layers.3.self_attn.q_b_proj"], "exl3")
+        self.assertEqual(kinds["model.layers.3.self_attn.indexer.weights_proj"], "native")
+        self.assertEqual(kinds["model.language_model.layers.3.self_attn.q_b_proj"], "exl3")
+
     def test_from_config_carries_kinds_and_default_is_empty(self):
         cfg = EXL3Config.from_config({
             "quant_method": "exl3",

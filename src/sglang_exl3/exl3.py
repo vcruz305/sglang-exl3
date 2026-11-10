@@ -1232,7 +1232,12 @@ def _tensor_storage_kinds(tensor_storage: Any) -> dict[str, str]:
         if not stored:
             continue
         is_exl3 = any(str(name).endswith(".trellis") for name in stored)
-        kinds[str(module)] = "exl3" if is_exl3 else "native"
+        kind = "exl3" if is_exl3 else "native"
+        name = str(module)
+        kinds[name] = kind
+        # SGLang passes "model.layers.N..." prefixes for GLM-5 while the pack records
+        # "model.language_model.layers.N..."; index both spellings.
+        kinds[name.replace("model.language_model.", "model.", 1)] = kind
     return kinds
 
 
