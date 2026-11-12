@@ -603,6 +603,17 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     layer._exl3_k = int(getattr(layer, "_exl3_bits", 4))
+    _set_fused_k(layer, inners)
+
+
+def _set_fused_k(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
+    # Per-projection K from the stored trellis shapes (the source of truth), not the layer-wide
+    # int(bits): a 2.32-bpw config gives int()=2 while the routed experts are 3-bit.
+    for which in ("gate", "up", "down"):
+        ks = {int(pack[which].K) for pack in inners}
+        if len(ks) != 1:
+            raise RuntimeError(f"EXL3 fused MoE needs one K per projection; {which} has K={sorted(ks)}")
+        setattr(layer, f"_exl3_k_{which}", ks.pop())
 
 
 _MOE_DIAG_LOGS = 0
@@ -1070,7 +1081,9 @@ def apply_exl3_fused_moe(
 
     fn = exllamav3_ext.exl3_moe
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
-    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
+    k_gate = int(getattr(layer, "_exl3_k_gate", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
+    k_up = int(getattr(layer, "_exl3_k_up", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
+    k_down = int(getattr(layer, "_exl3_k_down", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
     args = (
         xh,
         out,
@@ -1082,9 +1095,9 @@ def apply_exl3_fused_moe(
         temps[2],
         temps[3],
         MOE_ACT_SILU,
-        k,
-        k,
-        k,
+        k_gate,
+        k_up,
+        k_down,
         ptrs["gate_trellis"],
         ptrs["gate_suh"],
         ptrs["gate_svh"],
