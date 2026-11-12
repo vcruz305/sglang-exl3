@@ -152,7 +152,8 @@ class EXL3DenseLinear:
         mul1_on = bool(mul1 is not None and int(mul1.reshape(-1)[0]) != 0)
         if mcg_on and mul1_on:
             raise ValueError("EXL3 linear has both mcg and mul1 markers set")
-        self.mcg = mcg_on or (not mul1_on)
+        # No marker = plain 3INST codebook (cb0), as exllamav3 does; do not silently force mcg.
+        self.mcg = mcg_on
         self.mul1 = mul1_on
 
 
