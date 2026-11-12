@@ -426,6 +426,17 @@ def fused_moe_enabled() -> bool:
     return os.environ.get("EXL3_FUSED_MOE", "1") != "0"
 
 
+def _exl3_moe_tail_args(fn) -> tuple:
+    """exllamav3 1.6.1 exl3_moe takes five positional args after num_active (35 in total):
+    output_scratch and fused_base (None: unused), count_lo and count_hi (0 .. 2**30: no expert is
+    skipped) and m_tile (16: the 1.4.4 row tile). The 1.4.4 binding has none of them. Detected
+    from the binding docstring, which lists arg34 only on 1.6.1."""
+    doc = getattr(fn, "__doc__", None) or ""
+    if "arg34" in doc:
+        return (None, None, 0, 1 << 30, 16)
+    return ()
+
+
 def _exl3_moe_accepts_num_active(fn) -> bool:
     try:
         import inspect
@@ -604,6 +615,7 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_concurrency = concurrency
     layer._exl3_k = int(getattr(layer, "_exl3_bits", 4))
     _set_fused_k(layer, inners)
+    build_coopmk_state(layer, inners)
 
 
 def _set_fused_k(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
@@ -614,6 +626,183 @@ def _set_fused_k(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
         if len(ks) != 1:
             raise RuntimeError(f"EXL3 fused MoE needs one K per projection; {which} has K={sorted(ks)}")
         setattr(layer, f"_exl3_k_{which}", ks.pop())
+
+
+# ---- CoopMK decode MoE (SGLANG_EXL3_MOE_COOPMK=1, default off) --------------------------------
+# Port of the native 1.6.1 decode path (block_sparse_mlp.py _coopmk_setup / _coopmk_forward): the
+# routed sum of up to COOPMK_MAX_ROWS rows runs as two plain kernel launches (ext.CoopMK,
+# exl3_moe_coopmk.cu), per-expert bitrates come from device tables, no host sync, no spin barrier.
+# Assumptions, checked by the CPU tests (tests/test_coopmk.py):
+#   * the routed scale (2.5) is already in `weights` (fuse_routed_scaling_factor_in_topk), so rw
+#     is passed unchanged, as the native path passes its routing weights;
+#   * the input is cast to fp16 and the weights to fp16, as the existing fused path does;
+#   * CoopMK clamps as act_gate() does: gate to max=limit, up to +-limit; limit 0 means no clamp,
+#     so an infinite limit maps to 0.0. The limit is fixed per CoopMK object, so each limit value
+#     gets its own object (cached per layer); a limit of 0 or NaN falls back;
+#   * CoopMK needs mul1 (not mcg), integer K 1..8 per expert and projection, whole expert range
+#     (expert_map None), SiLU, dims that are multiples of 128. Anything else falls back to the
+#     existing fused / python-loop path, with the reason kept in layer._exl3_coopmk_reason.
+COOPMK_MAX_ROWS = 8  # MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h (1.6.1)
+COOPMK_MAX_TOPK = 8  # scratch is sized for 8 rows x 8 slots
+COOPMK_PLAN = 3  # native default (EXL3_COOPMK_PLAN); fastest per call on the tested pack
+_COOPMK_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def coopmk_enabled() -> bool:
+    return os.environ.get("SGLANG_EXL3_MOE_COOPMK", "0") == "1"
+
+
+def _coopmk_class():
+    try:
+        ext = load_exllamav3_ext()
+    except Exception:
+        return None
+    return getattr(ext, "CoopMK", None)
+
+
+def _coopmk_act_limit(limit: float) -> float | None:
+    value = float(limit)
+    if math.isnan(value) or value == 0.0:
+        return None
+    return 0.0 if math.isinf(value) else value
+
+
+def _coopmk_buffer(device: torch.device, name: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Scratch is shared by every MoE layer of the same shape: launches run in stream order and the
+    # kernels reset their own counters, so no per-layer copy is needed.
+    key = (str(device), name, tuple(shape), dtype)
+    buf = _COOPMK_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.zeros(tuple(shape), dtype=dtype, device=device)
+        _COOPMK_BUFFERS[key] = buf
+    return buf
+
+
+def coopmk_unsupported_reason(
+    layer: torch.nn.Module, inners: list[dict[str, Any]], limit: float
+) -> str | None:
+    if not coopmk_enabled():
+        return "SGLANG_EXL3_MOE_COOPMK not set"
+    if _coopmk_act_limit(limit) is None:
+        return f"activation limit {limit!r} not representable"
+    if getattr(layer, "_exl3_use_mcg", True) or not getattr(layer, "_exl3_use_mul1", False):
+        return "CoopMK needs the mul1 codebook (not mcg)"
+    if not inners:
+        return "no experts"
+    ptrs = getattr(layer, "_exl3_ptrs", None)
+    required = (
+        "gate_trellis", "gate_suh", "gate_svh",
+        "up_trellis", "up_suh", "up_svh",
+        "down_trellis", "down_suh", "down_svh",
+    )
+    if not isinstance(ptrs, dict) or any(key not in ptrs for key in required):
+        return "fused pointer tables missing"
+    for which in ("gate", "up", "down"):
+        for pack in inners:
+            k = pack[which].K
+            if float(k) != int(k) or not 1 <= int(k) <= 8:
+                return f"{which} K={k} outside the integer 1..8 CoopMK range"
+    hidden = int(getattr(layer, "_exl3_hidden_size", 0))
+    inter = int(getattr(layer, "_exl3_intermediate_local", 0))
+    hi = int(inners[0]["gate"].suh.numel())
+    ho = int(inners[0]["down"].svh.numel())
+    if hi != hidden or ho != hidden or hidden % 128 or inter % 128 or hidden % 4:
+        return f"shape hidden={hidden} hi={hi} ho={ho} inter={inter} not CoopMK-compatible"
+    if _coopmk_class() is None:
+        return "exllamav3_ext has no CoopMK (build is not 1.6.1)"
+    return None
+
+
+def coopmk_build(layer: torch.nn.Module, inners: list[dict[str, Any]], limit: float):
+    """Construct ext.CoopMK for one layer and one activation limit, as block_sparse_mlp.py
+    _coopmk_setup does. Returns (object, output buffer) or None; the reason is kept on the layer."""
+    reason = coopmk_unsupported_reason(layer, inners, limit)
+    if reason is not None:
+        layer._exl3_coopmk_reason = reason
+        return None
+    cls = _coopmk_class()
+    device = layer.w13_trellis.device
+    ptrs = layer._exl3_ptrs
+    hidden = int(layer._exl3_hidden_size)
+    inter = int(layer._exl3_intermediate_local)
+    slots = COOPMK_MAX_ROWS * COOPMK_MAX_TOPK
+    f16 = torch.float16
+    f32 = torch.float32
+
+    def ktab(which: str) -> torch.Tensor:
+        return torch.tensor([int(pack[which].K) for pack in inners], dtype=torch.int32, device=device)
+
+    ctr_len = slots * (inter // 128) + COOPMK_MAX_ROWS * (hidden // 128) + 2 + (slots + 1) + slots
+    ctr = _coopmk_buffer(device, "coopmk_ctr", (ctr_len,), torch.int32)
+    out = _coopmk_buffer(device, "coopmk_out", (COOPMK_MAX_ROWS, hidden), f32)
+    obj = cls(
+        hidden,
+        ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+        ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+        ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+        None, None, None,  # no expert biases in this pack
+        ktab("gate"), ktab("up"), ktab("down"),
+        False,  # mcg
+        True,  # mul1
+        0,  # act: SiLU (MOE_ACT_SILU)
+        _coopmk_act_limit(limit),
+        True,  # gated
+        _coopmk_buffer(device, "coopmk_had_g", (slots, hidden), f16),
+        _coopmk_buffer(device, "coopmk_had_u", (slots, hidden), f16),
+        _coopmk_buffer(device, "coopmk_gu_g", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_gu_u", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_act", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_d_out", (slots, hidden), f32),
+        ctr,
+        out,
+        None,  # no shared expert in the fused MoE call
+        -1,
+        -1,  # whole expert range
+        COOPMK_PLAN,
+    )
+    layer._exl3_coopmk_reason = None
+    return obj, out
+
+
+def build_coopmk_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
+    """At load: build the default-limit CoopMK object when the flag is on. Errors from the
+    extension constructor propagate (fail loudly, never a silent slow path)."""
+    layer._exl3_coopmk_by_limit = {}
+    if not coopmk_enabled():
+        return
+    key = _coopmk_act_limit(SWIGLU_LIMIT_DEFAULT)
+    built = coopmk_build(layer, inners, SWIGLU_LIMIT_DEFAULT)
+    layer._exl3_coopmk_by_limit[key] = built
+    import sys
+    sys.stderr.write(f"[COOPMK] built={built is not None} reason={getattr(layer, '_exl3_coopmk_reason', None)}\n")
+    sys.stderr.flush()
+
+
+def _coopmk_select(layer, inners, limit, expert_map, tokens: int, topk: int, ids: torch.Tensor):
+    if not coopmk_enabled() or expert_map is not None or ids.dtype != torch.long:
+        return None
+    if tokens > COOPMK_MAX_ROWS or topk > COOPMK_MAX_TOPK:
+        return None
+    key = _coopmk_act_limit(limit)
+    if key is None:
+        return None
+    cache = getattr(layer, "_exl3_coopmk_by_limit", None)
+    if cache is None:
+        cache = {}
+        layer._exl3_coopmk_by_limit = cache
+    if key not in cache:
+        cache[key] = coopmk_build(layer, inners, limit)
+    return cache[key]
+
+
+def apply_exl3_coopmk(x2d: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, layer, built) -> torch.Tensor:
+    obj, out = built
+    tokens = int(x2d.shape[0])
+    xh = x2d.contiguous().half()
+    rw = weights.reshape(tokens, -1).to(dtype=torch.float16).contiguous()
+    obj.run(xh, ids.contiguous(), rw, None, -1, -1, -1)
+    layer._exl3_last_apply = "coopmk"
+    return out[:tokens].clone()
 
 
 _MOE_DIAG_LOGS = 0
@@ -1049,6 +1238,10 @@ def apply_exl3_fused_moe(
         except Exception as exc:
             logger.debug("Native EXL3 MoE dispatch failed in fused entry: %s", exc)
 
+    coop_built = _coopmk_select(layer, inners, limit, expert_map, tokens, int(ids.shape[-1]), ids)
+    if coop_built is not None:
+        return apply_exl3_coopmk(x2d, ids, weights, layer, coop_built)
+
     try:
         import exllamav3_ext
     except Exception:
@@ -1116,7 +1309,7 @@ def apply_exl3_fused_moe(
         float(limit),
     )
     if n_active_host is not None:
-        fn(*args, n_active_host)
+        fn(*args, n_active_host, *_exl3_moe_tail_args(fn))
     else:
         fn(*args)
 
@@ -1196,6 +1389,12 @@ def apply_exl3_experts(
             except Exception as exc:
                 layer._exl3_native_error = repr(exc)
                 raise RuntimeError("Explicit native EXL3 decode failed; refusing silent fallback") from exc
+
+    # CoopMK is checked here, not only inside apply_exl3_fused_moe: with EXL3_FUSED_MOE=0 (the
+    # campaign launch setting) the fused entry is never reached, so the dispatch must come first.
+    coop_built = _coopmk_select(layer, inners, limit, expert_map, tokens, int(ids.shape[-1]), ids)
+    if coop_built is not None:
+        return apply_exl3_coopmk(x2d, ids, weights, layer, coop_built).to(dtype=x.dtype)
 
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
