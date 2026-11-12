@@ -509,6 +509,14 @@ def map_topk_to_local(ids: torch.Tensor, n_local: int, expert_map: torch.Tensor 
     return torch.where(invalid, flat.new_full(flat.shape, n_local), mapped).reshape(original_shape)
 
 
+def _cuda_graph_capture_active() -> bool:
+    # True while the current stream is being recorded into a CUDA graph. CPU-only torch builds raise here.
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def apply_exl3_python_loop(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -521,6 +529,13 @@ def apply_exl3_python_loop(
     out: torch.Tensor | None = None,
     layer: torch.nn.Module | None = None,
 ) -> torch.Tensor:
+    # Fail closed before the capture: torch.unique, .tolist(), .item() and nonzero() force a host sync,
+    # which CUDA stream capture rejects with cudaErrorStreamCaptureUnsupported much later and less legibly.
+    if _cuda_graph_capture_active():
+        raise RuntimeError(
+            "EXL3 python-loop MoE is not CUDA-graph capturable (torch.unique/.tolist()/nonzero sync the stream). "
+            "Use EXL3_FUSED_MOE=1 for graph-captured decode, or run with decode CUDA graphs disabled."
+        )
     tokens, hidden = x2d.shape
     if (
         os.environ.get("EXL3_FUSED_MOE", "1") != "0"
