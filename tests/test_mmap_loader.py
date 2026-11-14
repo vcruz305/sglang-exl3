@@ -71,6 +71,50 @@ class TestEXL3MMapLoader(unittest.TestCase):
         except Exception:
             pass
 
+    @unittest.skipUnless(_HAS_SAFETENSORS, "safetensors not installed")
+    def test_pread_iterator_roundtrip_dtypes(self):
+        from sglang_exl3.loader import iter_safetensors_pread
+        tmp_dir = tempfile.mkdtemp()
+        path = os.path.join(tmp_dir, "model-00001-of-00001.safetensors")
+        tensors = {
+            "bf16": torch.randn(33, 17).to(torch.bfloat16),
+            "f16": torch.randn(8, 16).to(torch.float16),
+            "f32": torch.randn(5).to(torch.float32),
+            "i16_trellis": torch.randint(-32768, 32767, (4, 16, 48), dtype=torch.int16),
+            "i32": torch.arange(12, dtype=torch.int32).reshape(3, 4),
+            "u8": torch.arange(256, dtype=torch.uint8),
+            "scalar": torch.tensor(3, dtype=torch.int32),
+            "empty": torch.empty(0, 4, dtype=torch.float16),
+        }
+        save_file(tensors, path)
+        try:
+            got = dict(iter_safetensors_pread(path))
+            self.assertEqual(set(got), set(tensors))
+            for name, ref in tensors.items():
+                self.assertEqual(got[name].dtype, ref.dtype, name)
+                self.assertEqual(tuple(got[name].shape), tuple(ref.shape), name)
+                self.assertTrue(torch.equal(got[name], ref), name)
+        finally:
+            os.remove(path)
+            os.rmdir(tmp_dir)
+
+    @unittest.skipUnless(_HAS_SAFETENSORS, "safetensors not installed")
+    def test_pread_iterator_fails_closed_on_unknown_dtype(self):
+        import struct as _struct
+        import json as _json
+        from sglang_exl3.loader import iter_safetensors_pread
+        tmp_dir = tempfile.mkdtemp()
+        path = os.path.join(tmp_dir, "bad.safetensors")
+        header = _json.dumps({"x": {"dtype": "C64", "shape": [2], "data_offsets": [0, 16]}}).encode()
+        with open(path, "wb") as fh:
+            fh.write(_struct.pack("<Q", len(header)) + header + bytes(16))
+        try:
+            with self.assertRaises(RuntimeError):
+                list(iter_safetensors_pread(path))
+        finally:
+            os.remove(path)
+            os.rmdir(tmp_dir)
+
     def test_sglang_loader_patch(self):
         try:
             from sglang.srt.model_loader.loader import get_model_loader, LoadConfig

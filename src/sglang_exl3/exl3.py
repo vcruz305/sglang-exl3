@@ -426,6 +426,17 @@ def fused_moe_enabled() -> bool:
     return os.environ.get("EXL3_FUSED_MOE", "1") != "0"
 
 
+def _exl3_moe_tail_args(fn) -> tuple:
+    """exllamav3 1.6.1 exl3_moe takes five positional args after num_active (35 in total):
+    output_scratch and fused_base (None: unused), count_lo and count_hi (0 .. 2**30: no expert is
+    skipped) and m_tile (16: the 1.4.4 row tile). The 1.4.4 binding has none of them. Detected
+    from the binding docstring, which lists arg34 only on 1.6.1."""
+    doc = getattr(fn, "__doc__", None) or ""
+    if "arg34" in doc:
+        return (None, None, 0, 1 << 30, 16)
+    return ()
+
+
 def _exl3_moe_accepts_num_active(fn) -> bool:
     try:
         import inspect
@@ -498,6 +509,14 @@ def map_topk_to_local(ids: torch.Tensor, n_local: int, expert_map: torch.Tensor 
     return torch.where(invalid, flat.new_full(flat.shape, n_local), mapped).reshape(original_shape)
 
 
+def _cuda_graph_capture_active() -> bool:
+    # True while the current stream is being recorded into a CUDA graph. CPU-only torch builds raise here.
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def apply_exl3_python_loop(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -510,6 +529,13 @@ def apply_exl3_python_loop(
     out: torch.Tensor | None = None,
     layer: torch.nn.Module | None = None,
 ) -> torch.Tensor:
+    # Fail closed before the capture: torch.unique, .tolist(), .item() and nonzero() force a host sync,
+    # which CUDA stream capture rejects with cudaErrorStreamCaptureUnsupported much later and less legibly.
+    if _cuda_graph_capture_active():
+        raise RuntimeError(
+            "EXL3 python-loop MoE is not CUDA-graph capturable (torch.unique/.tolist()/nonzero sync the stream). "
+            "Use EXL3_FUSED_MOE=1 for graph-captured decode, or run with decode CUDA graphs disabled."
+        )
     tokens, hidden = x2d.shape
     if (
         os.environ.get("EXL3_FUSED_MOE", "1") != "0"
@@ -603,6 +629,195 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     layer._exl3_k = int(getattr(layer, "_exl3_bits", 4))
+    _set_fused_k(layer, inners)
+    build_coopmk_state(layer, inners)
+
+
+def _set_fused_k(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
+    # Per-projection K from the stored trellis shapes (the source of truth), not the layer-wide
+    # int(bits): a 2.32-bpw config gives int()=2 while the routed experts are 3-bit.
+    for which in ("gate", "up", "down"):
+        ks = {int(pack[which].K) for pack in inners}
+        if len(ks) != 1:
+            raise RuntimeError(f"EXL3 fused MoE needs one K per projection; {which} has K={sorted(ks)}")
+        setattr(layer, f"_exl3_k_{which}", ks.pop())
+
+
+# ---- CoopMK decode MoE (SGLANG_EXL3_MOE_COOPMK=1, default off) --------------------------------
+# Port of the native 1.6.1 decode path (block_sparse_mlp.py _coopmk_setup / _coopmk_forward): the
+# routed sum of up to COOPMK_MAX_ROWS rows runs as two plain kernel launches (ext.CoopMK,
+# exl3_moe_coopmk.cu), per-expert bitrates come from device tables, no host sync, no spin barrier.
+# Assumptions, checked by the CPU tests (tests/test_coopmk.py):
+#   * the routed scale (2.5) is already in `weights` (fuse_routed_scaling_factor_in_topk), so rw
+#     is passed unchanged, as the native path passes its routing weights;
+#   * the input is cast to fp16 and the weights to fp16, as the existing fused path does;
+#   * CoopMK clamps as act_gate() does: gate to max=limit, up to +-limit; limit 0 means no clamp,
+#     so an infinite limit maps to 0.0. The limit is fixed per CoopMK object, so each limit value
+#     gets its own object (cached per layer); a limit of 0 or NaN falls back;
+#   * CoopMK needs mul1 (not mcg), integer K 1..8 per expert and projection, whole expert range
+#     (expert_map None), SiLU, dims that are multiples of 128. Anything else falls back to the
+#     existing fused / python-loop path, with the reason kept in layer._exl3_coopmk_reason.
+COOPMK_MAX_ROWS = 8  # MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h (1.6.1)
+COOPMK_MAX_TOPK = 8  # scratch is sized for 8 rows x 8 slots
+COOPMK_PLAN = 3  # native default (EXL3_COOPMK_PLAN); fastest per call on the tested pack
+_COOPMK_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def coopmk_enabled() -> bool:
+    return os.environ.get("SGLANG_EXL3_MOE_COOPMK", "0") == "1"
+
+
+def _coopmk_class():
+    try:
+        ext = load_exllamav3_ext()
+    except Exception:
+        return None
+    return getattr(ext, "CoopMK", None)
+
+
+def _coopmk_act_limit(limit: float) -> float | None:
+    value = float(limit)
+    if math.isnan(value) or value == 0.0:
+        return None
+    return 0.0 if math.isinf(value) else value
+
+
+def _coopmk_buffer(device: torch.device, name: str, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Scratch is shared by every MoE layer of the same shape: launches run in stream order and the
+    # kernels reset their own counters, so no per-layer copy is needed.
+    key = (str(device), name, tuple(shape), dtype)
+    buf = _COOPMK_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.zeros(tuple(shape), dtype=dtype, device=device)
+        _COOPMK_BUFFERS[key] = buf
+    return buf
+
+
+def coopmk_unsupported_reason(
+    layer: torch.nn.Module, inners: list[dict[str, Any]], limit: float
+) -> str | None:
+    if not coopmk_enabled():
+        return "SGLANG_EXL3_MOE_COOPMK not set"
+    if _coopmk_act_limit(limit) is None:
+        return f"activation limit {limit!r} not representable"
+    if getattr(layer, "_exl3_use_mcg", True) or not getattr(layer, "_exl3_use_mul1", False):
+        return "CoopMK needs the mul1 codebook (not mcg)"
+    if not inners:
+        return "no experts"
+    ptrs = getattr(layer, "_exl3_ptrs", None)
+    required = (
+        "gate_trellis", "gate_suh", "gate_svh",
+        "up_trellis", "up_suh", "up_svh",
+        "down_trellis", "down_suh", "down_svh",
+    )
+    if not isinstance(ptrs, dict) or any(key not in ptrs for key in required):
+        return "fused pointer tables missing"
+    for which in ("gate", "up", "down"):
+        for pack in inners:
+            k = pack[which].K
+            if float(k) != int(k) or not 1 <= int(k) <= 8:
+                return f"{which} K={k} outside the integer 1..8 CoopMK range"
+    hidden = int(getattr(layer, "_exl3_hidden_size", 0))
+    inter = int(getattr(layer, "_exl3_intermediate_local", 0))
+    hi = int(inners[0]["gate"].suh.numel())
+    ho = int(inners[0]["down"].svh.numel())
+    if hi != hidden or ho != hidden or hidden % 128 or inter % 128 or hidden % 4:
+        return f"shape hidden={hidden} hi={hi} ho={ho} inter={inter} not CoopMK-compatible"
+    if _coopmk_class() is None:
+        return "exllamav3_ext has no CoopMK (build is not 1.6.1)"
+    return None
+
+
+def coopmk_build(layer: torch.nn.Module, inners: list[dict[str, Any]], limit: float):
+    """Construct ext.CoopMK for one layer and one activation limit, as block_sparse_mlp.py
+    _coopmk_setup does. Returns (object, output buffer) or None; the reason is kept on the layer."""
+    reason = coopmk_unsupported_reason(layer, inners, limit)
+    if reason is not None:
+        layer._exl3_coopmk_reason = reason
+        return None
+    cls = _coopmk_class()
+    device = layer.w13_trellis.device
+    ptrs = layer._exl3_ptrs
+    hidden = int(layer._exl3_hidden_size)
+    inter = int(layer._exl3_intermediate_local)
+    slots = COOPMK_MAX_ROWS * COOPMK_MAX_TOPK
+    f16 = torch.float16
+    f32 = torch.float32
+
+    def ktab(which: str) -> torch.Tensor:
+        return torch.tensor([int(pack[which].K) for pack in inners], dtype=torch.int32, device=device)
+
+    ctr_len = slots * (inter // 128) + COOPMK_MAX_ROWS * (hidden // 128) + 2 + (slots + 1) + slots
+    ctr = _coopmk_buffer(device, "coopmk_ctr", (ctr_len,), torch.int32)
+    out = _coopmk_buffer(device, "coopmk_out", (COOPMK_MAX_ROWS, hidden), f32)
+    obj = cls(
+        hidden,
+        ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+        ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+        ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+        None, None, None,  # no expert biases in this pack
+        ktab("gate"), ktab("up"), ktab("down"),
+        False,  # mcg
+        True,  # mul1
+        0,  # act: SiLU (MOE_ACT_SILU)
+        _coopmk_act_limit(limit),
+        True,  # gated
+        _coopmk_buffer(device, "coopmk_had_g", (slots, hidden), f16),
+        _coopmk_buffer(device, "coopmk_had_u", (slots, hidden), f16),
+        _coopmk_buffer(device, "coopmk_gu_g", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_gu_u", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_act", (slots, inter), f16),
+        _coopmk_buffer(device, "coopmk_d_out", (slots, hidden), f32),
+        ctr,
+        out,
+        None,  # no shared expert in the fused MoE call
+        -1,
+        -1,  # whole expert range
+        COOPMK_PLAN,
+    )
+    layer._exl3_coopmk_reason = None
+    return obj, out
+
+
+def build_coopmk_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
+    """At load: build the default-limit CoopMK object when the flag is on. Errors from the
+    extension constructor propagate (fail loudly, never a silent slow path)."""
+    layer._exl3_coopmk_by_limit = {}
+    if not coopmk_enabled():
+        return
+    key = _coopmk_act_limit(SWIGLU_LIMIT_DEFAULT)
+    built = coopmk_build(layer, inners, SWIGLU_LIMIT_DEFAULT)
+    layer._exl3_coopmk_by_limit[key] = built
+    import sys
+    sys.stderr.write(f"[COOPMK] built={built is not None} reason={getattr(layer, '_exl3_coopmk_reason', None)}\n")
+    sys.stderr.flush()
+
+
+def _coopmk_select(layer, inners, limit, expert_map, tokens: int, topk: int, ids: torch.Tensor):
+    if not coopmk_enabled() or expert_map is not None or ids.dtype != torch.long:
+        return None
+    if tokens > COOPMK_MAX_ROWS or topk > COOPMK_MAX_TOPK:
+        return None
+    key = _coopmk_act_limit(limit)
+    if key is None:
+        return None
+    cache = getattr(layer, "_exl3_coopmk_by_limit", None)
+    if cache is None:
+        cache = {}
+        layer._exl3_coopmk_by_limit = cache
+    if key not in cache:
+        cache[key] = coopmk_build(layer, inners, limit)
+    return cache[key]
+
+
+def apply_exl3_coopmk(x2d: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, layer, built) -> torch.Tensor:
+    obj, out = built
+    tokens = int(x2d.shape[0])
+    xh = x2d.contiguous().half()
+    rw = weights.reshape(tokens, -1).to(dtype=torch.float16).contiguous()
+    obj.run(xh, ids.contiguous(), rw, None, -1, -1, -1)
+    layer._exl3_last_apply = "coopmk"
+    return out[:tokens].clone()
 
 
 _MOE_DIAG_LOGS = 0
@@ -1038,6 +1253,10 @@ def apply_exl3_fused_moe(
         except Exception as exc:
             logger.debug("Native EXL3 MoE dispatch failed in fused entry: %s", exc)
 
+    coop_built = _coopmk_select(layer, inners, limit, expert_map, tokens, int(ids.shape[-1]), ids)
+    if coop_built is not None:
+        return apply_exl3_coopmk(x2d, ids, weights, layer, coop_built)
+
     try:
         import exllamav3_ext
     except Exception:
@@ -1070,7 +1289,9 @@ def apply_exl3_fused_moe(
 
     fn = exllamav3_ext.exl3_moe
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
-    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
+    k_gate = int(getattr(layer, "_exl3_k_gate", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
+    k_up = int(getattr(layer, "_exl3_k_up", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
+    k_down = int(getattr(layer, "_exl3_k_down", getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))))
     args = (
         xh,
         out,
@@ -1082,9 +1303,9 @@ def apply_exl3_fused_moe(
         temps[2],
         temps[3],
         MOE_ACT_SILU,
-        k,
-        k,
-        k,
+        k_gate,
+        k_up,
+        k_down,
         ptrs["gate_trellis"],
         ptrs["gate_suh"],
         ptrs["gate_svh"],
@@ -1103,7 +1324,7 @@ def apply_exl3_fused_moe(
         float(limit),
     )
     if n_active_host is not None:
-        fn(*args, n_active_host)
+        fn(*args, n_active_host, *_exl3_moe_tail_args(fn))
     else:
         fn(*args)
 
@@ -1184,6 +1405,12 @@ def apply_exl3_experts(
                 layer._exl3_native_error = repr(exc)
                 raise RuntimeError("Explicit native EXL3 decode failed; refusing silent fallback") from exc
 
+    # CoopMK is checked here, not only inside apply_exl3_fused_moe: with EXL3_FUSED_MOE=0 (the
+    # campaign launch setting) the fused entry is never reached, so the dispatch must come first.
+    coop_built = _coopmk_select(layer, inners, limit, expert_map, tokens, int(ids.shape[-1]), ids)
+    if coop_built is not None:
+        return apply_exl3_coopmk(x2d, ids, weights, layer, coop_built).to(dtype=x.dtype)
+
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
@@ -1219,6 +1446,111 @@ def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
     return prefix == suffix or prefix.endswith("." + suffix)
 
 
+def _tensor_storage_kinds(tensor_storage: Any) -> dict[str, str]:
+    """Map module prefix -> "exl3" | "native" from quantization_config.json tensor_storage.
+
+    A module whose stored tensors include ``.trellis`` is EXL3; any other module with stored
+    tensors (a plain ``.weight``, e.g. the router gate or GDN/MLA projections in mixed packs) is
+    native BF16. Entries with no stored tensors are skipped.
+    """
+    kinds: dict[str, str] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        if not stored:
+            continue
+        is_exl3 = any(str(name).endswith(".trellis") for name in stored)
+        kind = "exl3" if is_exl3 else "native"
+        name = str(module)
+        kinds[name] = kind
+        # SGLang passes "model.layers.N..." prefixes for GLM-5 while the pack records
+        # "model.language_model.layers.N..."; index both spellings.
+        kinds[name.replace("model.language_model.", "model.", 1)] = kind
+    return kinds
+
+
+_NATIVE_STORAGE_LOGGED: set[str] = set()
+
+# Merged SGLang modules whose checkpoint tensors are stored per child projection.
+_MERGED_STORAGE_CHILDREN = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+}
+
+
+def storage_kind_for_prefix(kinds: dict[str, str], prefix: str) -> Optional[str]:
+    """tensor_storage kind for a module prefix, resolving merged modules via their children.
+
+    A merged module (e.g. ``mlp.gate_up_proj``) has no tensor_storage entry of its own when the
+    pack stores ``gate_proj`` / ``up_proj``. If its children are EXL3 the merged module is EXL3.
+    """
+    kind = kinds.get(prefix)
+    if kind is not None:
+        return kind
+    leaf = prefix.rsplit(".", 1)[-1]
+    children = _MERGED_STORAGE_CHILDREN.get(leaf)
+    if not children:
+        return None
+    parent = prefix[: len(prefix) - len(leaf)]
+    child_kinds = {kinds.get(parent + c) for c in children} - {None}
+    if child_kinds == {"exl3"}:
+        return "exl3"
+    if child_kinds == {"native"}:
+        return "native"
+    if child_kinds:
+        raise RuntimeError(f"EXL3 storage: merged module {prefix} has mixed child kinds {sorted(str(k) for k in child_kinds)}")
+    return None
+
+
+def _tensor_storage_out_sizes(tensor_storage: Any) -> dict[str, int]:
+    """Output width per EXL3 module from its stored trellis shape: trellis = [in/16, out/16, 16*bits]."""
+    out: dict[str, int] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        name = str(module)
+        for tensor_name, meta in stored.items():
+            if not str(tensor_name).endswith(".trellis"):
+                continue
+            shape = (meta or {}).get("shape") or []
+            if len(shape) != 3:
+                continue
+            width = int(shape[1]) * 16
+            out[name] = width
+            out[name.replace("model.language_model.", "model.", 1)] = width
+    return out
+
+
+def _tensor_storage_bits(tensor_storage: Any) -> tuple[dict[str, int], dict[int, int]]:
+    """Per-module EXL3 bits and per-layer expert bits from tensor_storage trellis shapes.
+
+    bits = trellis last dim / 16 (the trellis packs 16 * bits words per group). Experts must be
+    uniform within a layer because the MoE kernel stacks them; a mixed layer fails closed.
+    """
+    module_bits: dict[str, int] = {}
+    layer_bits: dict[int, int] = {}
+    for module, entry in dict(tensor_storage or {}).items():
+        stored = (entry or {}).get("stored_tensors") or {}
+        name = str(module)
+        for tensor_name, meta in stored.items():
+            if not str(tensor_name).endswith(".trellis"):
+                continue
+            shape = (meta or {}).get("shape") or []
+            if not shape:
+                continue  # no recorded shape: leave bits to the config fallback
+            if int(shape[-1]) % 16 != 0:
+                raise ValueError(f"bad trellis shape for {name}: {shape}")
+            bits = int(shape[-1]) // 16
+            module_bits[name] = bits
+            module_bits[name.replace("model.language_model.", "model.", 1)] = bits
+            if ".experts." in name:
+                m = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+                if m is not None:
+                    layer = int(m.group(1))
+                    prev = layer_bits.setdefault(layer, bits)
+                    if prev != bits:
+                        raise ValueError(f"mixed expert bits in layer {layer}: {prev} vs {bits}")
+    return module_bits, layer_bits
+
+
 class EXL3Config(QuantizationConfig):
     """SGLang quantization config for native sm_121 Blackwell EXL3/MCG models."""
 
@@ -1252,6 +1584,9 @@ class EXL3Config(QuantizationConfig):
             raise ValueError(f"unsupported non_routed_exl3 codebook={nr_codebook!r}")
 
         self.raw_config = dict(kwargs)
+        # Per-module storage kinds from the checkpoint's tensor_storage (set by from_config).
+        self.tensor_storage_kinds: dict[str, str] = {}
+        self.tensor_storage_out_sizes: dict[str, int] = {}
         if self.codebook not in ("mcg", "mul1"):
             raise ValueError(f"unsupported codebook={self.codebook!r}; must be 'mcg' or 'mul1'")
         if self.bits not in (2, 3, 4, 5, 6):
@@ -1262,10 +1597,36 @@ class EXL3Config(QuantizationConfig):
 
     _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
+    def merged_split_sizes(self, prefix: str) -> Optional[list[int]]:
+        """Per-child output widths for a merged module stored as separate EXL3 children.
+
+        SGLang may build e.g. fused_qkv_a_proj_with_mqa as ONE linear (out = q_a + kv_a) while the
+        pack stores q_a_proj and kv_a_proj_with_mqa separately. Returns [q_a_out, kv_a_out] so the
+        linear gets one EXL3 shard per child. None when the prefix is not such a module.
+        """
+        leaf = (prefix or "").rsplit(".", 1)[-1]
+        children = _MERGED_STORAGE_CHILDREN.get(leaf)
+        if not children:
+            return None
+        parent = prefix[: len(prefix) - len(leaf)]
+        sizes = [self.tensor_storage_out_sizes.get(parent + c) for c in children]
+        if any(x is None for x in sizes):
+            return None
+        return [int(x) for x in sizes]
+
     def bits_for_prefix(self, prefix: str) -> int:
+        # Stored trellis width is the source of truth for mixed packs: a linear's bits are its
+        # trellis last dim / 16, and experts are uniform per layer.
+        storage_bits = getattr(self, "tensor_storage_bits", None) or {}
+        if prefix in storage_bits:
+            return storage_bits[prefix]
+        m = self._LAYER_RE.search(prefix or "")
+        if m is not None:
+            layer_storage = getattr(self, "storage_layer_bits", None) or {}
+            if int(m.group(1)) in layer_storage:
+                return layer_storage[int(m.group(1))]
         if not self.layer_bits:
             return self.bits
-        m = self._LAYER_RE.search(prefix or "")
         if m is None:
             return self.bits
         return self.layer_bits.get(int(m.group(1)), self.bits)
@@ -1345,6 +1706,9 @@ class EXL3Config(QuantizationConfig):
         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
+        inst.tensor_storage_kinds = _tensor_storage_kinds(config.get("tensor_storage"))
+        inst.tensor_storage_out_sizes = _tensor_storage_out_sizes(config.get("tensor_storage"))
+        inst.tensor_storage_bits, inst.storage_layer_bits = _tensor_storage_bits(config.get("tensor_storage"))
         _mb = config.get("mtp_bits", None)
         if _mb is None:
             _mb = config.get("bits", inst.bits)
@@ -1455,10 +1819,29 @@ class EXL3Config(QuantizationConfig):
                     return UnquantizedLinearMethod()
                 except Exception:
                     return None
+            # Checkpoint storage decides the target linears of a mixed pack: a module whose stored
+            # tensors are a plain .weight stays native BF16. A module with no tensor_storage entry
+            # also counts as native (for this pack every non-expert EXL3 target linear is listed).
+            if not is_draft_layer and self.tensor_storage_kinds and storage_kind_for_prefix(self.tensor_storage_kinds, prefix) != "exl3":
+                if prefix not in _NATIVE_STORAGE_LOGGED:
+                    _NATIVE_STORAGE_LOGGED.add(prefix)
+                    logger.info(
+                        "EXL3 storage: %s -> native (tensor_storage kind=%s)",
+                        prefix,
+                        self.tensor_storage_kinds.get(prefix, "absent"),
+                    )
+                try:
+                    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+                    return UnquantizedLinearMethod()
+                except Exception:
+                    return None
             if dense_enabled and not is_draft_layer:
                 from .dense import EXL3LinearMethod
 
-                return EXL3LinearMethod(self, bits=self.bits_for_prefix(prefix))
+                method = EXL3LinearMethod(self, bits=self.bits_for_prefix(prefix))
+                method.split_sizes = self.merged_split_sizes(prefix)
+                return method
 
             if not is_draft_layer and self._matches_non_routed_exl3(prefix):
                 from .dense import EXL3LinearMethod
